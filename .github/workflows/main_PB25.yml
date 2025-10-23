@@ -22,15 +22,15 @@ jobs:
     - name: Log in to registry
       uses: docker/login-action@v2
       with:
-        registry: https://glgcontainerregistry/
-        username: ${{ secrets.AzureAppService_ContainerUsername_0133c39be73f4bbf9d8aeab4f798436e }}
-        password: ${{ secrets.AzureAppService_ContainerPassword_c15bf7d03e034e2aa8ebba36c71a001f }}
+        registry: https://glgaicontainerregistry/
+        username: ${{ secrets.AzureAppService_ContainerUsername_9859fe78eded47f2b86ee32be53b1bdd }}
+        password: ${{ secrets.AzureAppService_ContainerPassword_61b1d6b088a942bba3cd39f1c9a4befa }}
 
     - name: Build and push container image to registry
       uses: docker/build-push-action@v3
       with:
         push: true
-        tags: glgcontainerregistry/${{ secrets.AzureAppService_ContainerUsername_0133c39be73f4bbf9d8aeab4f798436e }}/sample-app-aoai-chatgpt:${{ github.sha }}
+        tags: glgaicontainerregistry/${{ secrets.AzureAppService_ContainerUsername_9859fe78eded47f2b86ee32be53b1bdd }}/joogni-chatbot:${{ github.sha }}
         file: ./Dockerfile
 
   deploy:
@@ -47,5 +47,5 @@ jobs:
       with:
         app-name: 'PB25'
         slot-name: 'production'
-        publish-profile: ${{ secrets.AzureAppService_PublishProfile_c0f74c85ff26488fbfcdfda86a6ad1d8 }}
-        images: 'glgcontainerregistry/${{ secrets.AzureAppService_ContainerUsername_0133c39be73f4bbf9d8aeab4f798436e }}/sample-app-aoai-chatgpt:${{ github.sha }}'
+        publish-profile: ${{ secrets.AzureAppService_PublishProfile_ff4850b2abf4480397dd8fef471fd9dd }}
+        images: 'glgaicontainerregistry/${{ secrets.AzureAppService_ContainerUsername_9859fe78eded47f2b86ee32be53b1bdd }}/joogni-chatbot:${{ github.sha }}'
