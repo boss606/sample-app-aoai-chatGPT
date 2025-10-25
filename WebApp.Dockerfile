@@ -1,31 +1,45 @@
-FROM node:20-alpine AS frontend  
-RUN mkdir -p /home/node/app/node_modules && chown -R node:node /home/node/app
+# Start from the Python base image
+FROM python:3.11-alpine
 
-WORKDIR /home/node/app 
-COPY ./frontend/package*.json ./  
-USER node
-RUN npm ci  
-COPY --chown=node:node ./frontend/ ./frontend  
-COPY --chown=node:node ./static/ ./static  
-WORKDIR /home/node/app/frontend
-RUN NODE_OPTIONS=--max_old_space_size=8192 npm run build
-  
-FROM python:3.11-alpine 
-RUN apk add --no-cache --virtual .build-deps \  
-    build-base \  
-    libffi-dev \  
-    openssl-dev \  
-    curl \  
-    && apk add --no-cache \  
-    libpq 
-  
-COPY requirements.txt /usr/src/app/  
-RUN pip install --no-cache-dir -r /usr/src/app/requirements.txt \  
-    && rm -rf /root/.cache  
-  
-COPY . /usr/src/app/  
-COPY --from=frontend /home/node/app/static  /usr/src/app/static/
-WORKDIR /usr/src/app  
-EXPOSE 80  
+# Install system dependencies needed by some Python packages
+# Keeping the original dependencies just in case
+RUN apk add --no-cache --virtual .build-deps \
+    build-base \
+    libffi-dev \
+    openssl-dev \
+    curl \
+    && apk add --no-cache \
+    libpq
 
-CMD ["gunicorn"  , "-b", "0.0.0.0:80", "app:app"]
+# Set the working directory
+WORKDIR /usr/src/app
+
+# Copy and install Python requirements first (for better caching)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /root/.cache
+
+# Copy the Python backend code and necessary files
+COPY ./backend ./backend
+COPY app.py .
+COPY gunicorn.conf.py .
+
+# Copy the original static assets (like favicon, images if any)
+# These will be available at /static/ on the web server
+COPY ./static ./static
+
+# Copy your new frontend files (index.html, index.css/style.css, script.js)
+# into a subfolder within the static directory.
+# These will be available at /static/ui/ on the web server.
+# The backend might need configuration to serve index.html from here as the root.
+COPY ./frontend ./static/ui
+
+# Expose the port Gunicorn will run on
+EXPOSE 80
+
+# Command to run the Python backend application using Gunicorn
+# This command remains the same as it starts your Python API backend
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]
+# Note: Changed from "-b 0.0.0.0:80" to use the config file like the original repo likely did.
+# If gunicorn.conf.py doesn't exist or isn't right, use:
+# CMD ["gunicorn", "-b", "0.0.0.0:80", "app:app"]
