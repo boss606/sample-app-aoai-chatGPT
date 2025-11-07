@@ -1,5 +1,3 @@
-# This workflow will install node dependencies (guarded), cache them, build the source and run tests across supported Node.js versions.
-# It skips frontend steps if frontend/package.json is absent, and uses `npm ci` when a lockfile exists (falls back to `npm install` otherwise).
 name: Build Frontend
 
 on:
@@ -17,7 +15,6 @@ jobs:
     strategy:
       matrix:
         node-version: [18.x, 20.x]
-        # Use Node LTS releases; adjust the list if you need other versions.
 
     steps:
       - uses: actions/checkout@v3
