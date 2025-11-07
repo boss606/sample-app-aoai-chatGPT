@@ -47,16 +47,18 @@ try:
     from msgraph.generated.models.search_query import SearchQuery
     from msgraph.generated.models.search_request import SearchRequest
     from msgraph.generated.models.entity_type import EntityType
-except Exception:
+except ImportError:
     # Fallbacks for different msgraph package layouts (older/newer differences)
     try:
         # Some msgraph packages expose models from a top-level generated.models module
         from msgraph import GraphServiceClient
         from msgraph.generated.search import query as query_module
         QueryPostRequestBody = getattr(query_module, "query_post_request_body", None) or getattr(query_module, "QueryPostRequestBody", None)
+        if QueryPostRequestBody is None:
+            raise ImportError("Could not find QueryPostRequestBody in query module")
         # Try to import model classes from the generated.models module
         from msgraph.generated.models import SearchQuery, SearchRequest, EntityType
-    except Exception:
+    except ImportError:
         # Final fallback — raise a clear ImportError so logs are explicit
         raise ImportError(
             "Could not import required msgraph classes. "
