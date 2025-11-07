@@ -39,14 +39,31 @@ from azure.ai.vision.imageanalysis.aio import ImageAnalysisClient
 # --- END FIX ---
 from azure.ai.vision.imageanalysis.models import VisualFeatures
 
-# --- CORRECTED MICROSOFT GRAPH IMPORTS ---
-from msgraph import GraphServiceClient
-from msgraph.generated.search.query.query_post_request_body import QueryPostRequestBody
-from msgraph.generated.models import (
-    SearchQuery,
-    SearchRequest,
-    EntityType
-)
+# --- *** CORRECTED MICROSOFT GRAPH IMPORTS (robust, with fallback) *** ---
+# Preferred: each model in its own module (newer msgraph codegen layout)
+try:
+    from msgraph import GraphServiceClient
+    from msgraph.generated.search.query.query_post_request_body import QueryPostRequestBody
+    from msgraph.generated.models.search_query import SearchQuery
+    from msgraph.generated.models.search_request import SearchRequest
+    from msgraph.generated.models.entity_type import EntityType
+except Exception:
+    # Fallbacks for different msgraph package layouts (older/newer differences)
+    try:
+        # Some msgraph packages expose models from a top-level generated.models module
+        from msgraph import GraphServiceClient
+        from msgraph.generated.search import query as query_module
+        QueryPostRequestBody = getattr(query_module, "query_post_request_body", None) or getattr(query_module, "QueryPostRequestBody", None)
+        # Try to import model classes from the generated.models module
+        from msgraph.generated.models import SearchQuery, SearchRequest, EntityType
+    except Exception:
+        # Final fallback — raise a clear ImportError so logs are explicit
+        raise ImportError(
+            "Could not import required msgraph classes. "
+            "Ensure the msgraph package is installed and compatible with this app. "
+            "If you recently changed msgraph SDK versions, update imports or pin a compatible msgraph package version."
+        )
+# --- *** END msgraph import block *** ---
 
 from backend.auth.auth_utils import get_authenticated_user_details
 from backend.security.ms_defender_utils import get_msdefender_user_json
