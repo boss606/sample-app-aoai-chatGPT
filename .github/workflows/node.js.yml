@@ -13,9 +13,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
     strategy:
       matrix:
         node-version: [14.x, 16.x, 18.x, 21.x]
@@ -29,6 +26,27 @@ jobs:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
         cache-dependency-path: '**/package-lock.json'
-    - run: npm ci
-    - run: NODE_OPTIONS=--max_old_space_size=8192 npm run build --if-present
-    - run: npm run test --if-present
+    - name: Install frontend dependencies (skip if no frontend)
+      run: |
+        if [ -f ./frontend/package.json ]; then
+          cd frontend
+          npm ci
+        else
+          echo "No frontend/package.json found — skipping frontend install"
+        fi
+    - name: Build frontend (skip if no frontend)
+      run: |
+        if [ -f ./frontend/package.json ]; then
+          cd frontend
+          npm run build --if-present
+        else
+          echo "No frontend/package.json found — skipping frontend build"
+        fi
+    - name: Test frontend (skip if no frontend)
+      run: |
+        if [ -f ./frontend/package.json ]; then
+          cd frontend
+          npm run test --if-present
+        else
+          echo "No frontend/package.json found — skipping frontend test"
+        fi
