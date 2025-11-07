@@ -38,7 +38,7 @@ jobs:
       run: |
         if [ -f ./frontend/package.json ]; then
           cd frontend
-          npm run build --if-present
+          NODE_OPTIONS=--max_old_space_size=8192 npm run build --if-present
         else
           echo "No frontend/package.json found — skipping frontend build"
         fi
