@@ -28,7 +28,7 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import ContainerClient
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from langchain.text_splitter import TextSplitter, MarkdownTextSplitter, RecursiveCharacterTextSplitter, PythonCodeTextSplitter
+from langchain_text_splitters import TextSplitter, MarkdownTextSplitter, RecursiveCharacterTextSplitter, PythonCodeTextSplitter
 from openai import AzureOpenAI
 from tqdm import tqdm
 
@@ -264,6 +264,7 @@ class Document(object):
     filepath: Optional[str] = None
     url: Optional[str] = None
     metadata: Optional[Dict] = None
+    domain: Optional[str] = None
     contentVector: Optional[List[float]] = None
     image_mapping: Optional[Dict] = None
 
@@ -752,8 +753,12 @@ def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None,
     FLAG_COHERE = os.getenv("FLAG_COHERE", "ENGLISH")
     FLAG_AOAI = os.getenv("FLAG_AOAI", "V3")
 
-    if azure_credential is None and (endpoint is None or key is None):
-        raise Exception("EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding")
+    # determine key from args or env (only for API-key auth); accept either API_KEY or KEY
+    api_key_env = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
+    effective_key = embedding_model_key if embedding_model_key else api_key_env
+
+    if azure_credential is None and endpoint is None:
+        raise Exception("EMBEDDING_MODEL_ENDPOINT is required for embedding")
 
     try:
         if FLAG_EMBEDDING_MODEL == "AOAI":
@@ -764,7 +769,9 @@ def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None,
             if azure_credential is not None:
                 api_key = azure_credential.get_token("https://cognitiveservices.azure.com/.default").token
             else:
-                api_key = embedding_model_key if embedding_model_key else os.getenv("AZURE_OPENAI_API_KEY")
+                api_key = effective_key
+                if api_key is None:
+                    raise Exception("AZURE_OPENAI_API_KEY or AZURE_OPENAI_KEY (or embedding_model_key) is required for embedding")
             
             client = AzureOpenAI(api_version=api_version, azure_endpoint=base_url, api_key=api_key)
             if FLAG_AOAI == "V2":
@@ -781,6 +788,11 @@ def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None,
                 key = embedding_model_key if embedding_model_key else os.getenv("COHERE_MULTILINGUAL_API_KEY")
             elif FLAG_COHERE == "ENGLISH":
                 key = embedding_model_key if embedding_model_key else os.getenv("COHERE_ENGLISH_API_KEY")
+            else:
+                key = None
+
+            if key is None:
+                raise Exception("COHERE_*_API_KEY (or embedding_model_key) is required for embedding")
             data, headers = get_payload_and_headers_cohere(text, key)
 
             body = str.encode(json.dumps(data))

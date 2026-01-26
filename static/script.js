@@ -989,8 +989,8 @@ async function handleFileSelect(event) {
 
     for (var i = 0; i < files.length; i++) {
         var file = files[i];
-        if (file.size > 10 * 1024 * 1024) {
-            addMessage('File "' + file.name + '" is too large. Maximum size is 10MB.', 'system-error');
+        if (file.size > 50 * 1024 * 1024) {
+            addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
             continue;
         }
 
@@ -1162,7 +1162,6 @@ async function sendMessage() {
 
     // Add agentic status indicator
     var statusId = addAgenticStatus();
-    console.log('Agentic result statusId:', statusId);
 
     try {
         var response = await fetch('/api/agentic', {
@@ -1178,7 +1177,6 @@ async function sendMessage() {
         });
 
         var data = await response.json();
-        console.log('Agentic result data:', data);
 
         if (data.error) {
             removeMessage(statusId);

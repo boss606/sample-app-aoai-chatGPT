@@ -11,12 +11,15 @@ from azure.search.documents.indexes.models import (
     SearchField,
     SearchFieldDataType,
     SemanticField,
-    SemanticSettings,
     SemanticConfiguration,
+    SemanticSearch,
+    SemanticPrioritizedFields,
     SearchIndex,
-    PrioritizedFields,
     VectorSearch,
-    VectorSearchAlgorithmConfiguration,
+    VectorSearchProfile,
+    HnswAlgorithmConfiguration,
+    VectorSearchProfile,
+    SimpleField,
     HnswParameters
 )
 from azure.search.documents import SearchClient
@@ -32,39 +35,49 @@ def create_search_index(index_name, index_client):
         index = SearchIndex(
             name=index_name,
             fields=[
-                SearchableField(name="id", type="Edm.String", key=True),
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True),
                 SearchableField(
                     name="content", type="Edm.String", analyzer_name="en.lucene"
                 ),
                 SearchableField(
                     name="title", type="Edm.String", analyzer_name="en.lucene"
                 ),
+                SimpleField(
+                    name="domain",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    searchable=True,
+                ),
                 SearchableField(name="filepath", type="Edm.String"),
                 SearchableField(name="url", type="Edm.String"),
                 SearchableField(name="metadata", type="Edm.String"),
                 SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
                             hidden=False, searchable=True, filterable=False, sortable=False, facetable=False,
-                            vector_search_dimensions=1536, vector_search_configuration="default"),
+                            vector_search_dimensions=1536, vector_search_profile_name="default"),
             ],
-            semantic_settings=SemanticSettings(
+            semantic_search=SemanticSearch(
+                default_configuration_name="default",
                 configurations=[
                     SemanticConfiguration(
                         name="default",
-                        prioritized_fields=PrioritizedFields(
+                        prioritized_fields=SemanticPrioritizedFields(
                             title_field=SemanticField(field_name="title"),
-                            prioritized_content_fields=[
-                                SemanticField(field_name="content")
-                            ],
+                            content_fields=[SemanticField(field_name="content")]
                         ),
                     )
                 ]
             ),
             vector_search=VectorSearch(
-                algorithm_configurations=[
-                    VectorSearchAlgorithmConfiguration(
+                algorithms=[
+                    HnswAlgorithmConfiguration(
                         name="default",
-                        kind="hnsw",
-                        hnsw_parameters=HnswParameters(metric="cosine")
+                        parameters=HnswParameters(m=4, ef_construction=400, ef_search=500)
+                    )
+                ],
+                profiles=[
+                    VectorSearchProfile(
+                        name="default",
+                        algorithm_configuration_name="default"
                     )
                 ]
             )
@@ -83,8 +96,16 @@ def upload_documents_to_index(docs, search_client, upload_batch_size=50):
         d = dataclasses.asdict(document)
         # add id to documents
         d.update({"@search.action": "upload", "id": str(id)})
+        # propagate domain from metadata to top-level field expected by schema
+        if not d.get("domain"):
+            meta = d.get("metadata")
+            if isinstance(meta, dict) and meta.get("domain"):
+                d["domain"] = meta.get("domain")
         if "contentVector" in d and d["contentVector"] is None:
             del d["contentVector"]
+        # Remove image_mapping if present (schema expects string fields only)
+        if "image_mapping" in d:
+            del d["image_mapping"]
         to_upload_dicts.append(d)
         id += 1
 

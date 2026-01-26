@@ -5,17 +5,39 @@ Now with Function Calling for Emails, Calendar, and OneDrive
 """
 
 import os
+import sys
+import io
+import math
 import json
 import base64
 import re
 import httpx
 import uuid
 from datetime import datetime, timedelta
+from typing import List, Tuple
+
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
 from openai import AzureOpenAI
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from azure.storage.blob import (
+    BlobServiceClient,
+    BlobSasPermissions,
+    generate_blob_sas,
+)
+
+from azure.identity import DefaultAzureCredential
+from pypdf import PdfReader
+import tiktoken
+
+from backend.storage.blob_storage import LegalDocsStorage
+
+from dotenv import load_dotenv
+load_dotenv(override=False)
 
 app = FastAPI(title="Joogni", description="California Family Law AI Assistant")
 
@@ -59,6 +81,9 @@ When answering legal questions:
 3. Provide practical, actionable guidance
 4. Note any recent changes in law or procedure
 5. Flag issues that may require judicial discretion
+6. Use the context provided to answer the question. If the context is not sufficient, respond politely: 'I don't have enough information to answer that. Please reformulate with more specifics related to California family law (including, but not limited to, custody modification, evidence code exclusion, domestic violence findings, child support calculations), and I'll try again. I will not invent information.'
+7. The information in the context is the only information you can use to answer the legal question. Do not use any other information or sources.
+
 
 For document analysis:
 - Identify key dates, parties, and issues
@@ -73,6 +98,85 @@ For email/calendar context:
 Always maintain attorney-client privilege awareness and remind users not to share client-identifying information outside secure channels.
 
 Format responses with clear structure when appropriate. Be thorough but concise."""
+
+# Multi-domain legal search config (single index with domain field)
+LEGAL_DOMAINS = [
+    d.strip()
+    for d in os.getenv("LEGAL_DOMAINS", "family_code,evidence_code").split(",")
+    if d.strip()
+]
+LEGAL_MAX_DOMAINS = int(os.getenv("LEGAL_MAX_DOMAINS", "3"))
+LEGAL_TOP_PER_DOMAIN = int(os.getenv("LEGAL_TOP_PER_DOMAIN", "3"))
+
+# Upload / attachment settings
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "5"))
+EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+
+deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
+print("AZURE_OPENAI_EMBEDDING_DEPLOYMENT present:", bool(deployment_name))
+
+def run_multi_domain_search(
+    search_client: SearchClient,
+    query: str,
+    domains: List[str],
+    max_domains: int,
+    top_per_domain: int,
+):
+    """
+    Controlled multi-domain search: applies filter "domain eq '<domain>'" for each candidate.
+    If there are no hits in any, performs a search without filter as a fallback.
+    Returns (context_chunks, domains_with_hits).
+    """
+    context_chunks = []
+    domains_with_hits = []
+
+    candidates = [d.strip() for d in domains if d.strip()][:max_domains]
+
+    for dom in candidates:
+        try:
+            results = search_client.search(
+                search_text=query,
+                top=top_per_domain,
+                filter=f"domain eq '{dom}'",
+            )
+            hit_count = 0
+            for r in results:
+                content = (r.get("content") or "").strip()
+                meta = (r.get("metadata") or "").strip()
+                source = r.get("filepath") or r.get("source") or r.get("url") or ""
+                if not content:
+                    continue
+                context_chunks.append(
+                    f"[DOMAIN: {dom}] [Source: {source}]\n{content}\nMeta: {meta}"
+                )
+                hit_count += 1
+            if hit_count > 0:
+                domains_with_hits.append(dom)
+        except Exception as e:
+            # log and continue with other domains
+            print(f"Search error for domain {dom}: {e}", file=sys.stderr)
+
+    # Fallback sem filtro se nada encontrado
+    if not context_chunks:
+        try:
+            results = search_client.search(search_text=query, top=top_per_domain)
+            for r in results:
+                content = (r.get("content") or "").strip()
+                meta = (r.get("metadata") or "").strip()
+                source = r.get("filepath") or r.get("source") or r.get("url") or ""
+                if not content:
+                    continue
+                context_chunks.append(
+                    f"[DOMAIN: unknown] [Source: {source}]\n{content}\nMeta: {meta}"
+                )
+            if context_chunks:
+                domains_with_hits.append("unknown")
+        except Exception as e:
+            print(f"Fallback search error: {e}", file=sys.stderr)
+
+    return context_chunks, domains_with_hits
 
 
 # Define tools for function calling
@@ -193,9 +297,202 @@ def is_authenticated(request: Request) -> bool:
 def get_graph_token(request: Request) -> str:
     """Get Microsoft Graph access token from Easy Auth."""
     token = request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN")
-    if not token:
-        return None
-    return token
+    principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
+    print(
+        "Graph token presence: "
+        f"access={bool(token)} len={len(token) if token else 0} "
+        f"principal={bool(principal)} id_token={bool(id_token)}",
+        file=sys.stderr,
+    )
+    if token:
+        print(f"Graph token prefix: {token[:10]}...", file=sys.stderr)
+    return token or None
+
+
+def _get_blob_service_client() -> BlobServiceClient:
+    """
+    Return a BlobServiceClient using connection string if present, otherwise Managed Identity.
+    """
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "glgaistorage")
+
+    if connection_string:
+        return BlobServiceClient.from_connection_string(connection_string)
+
+    credential = DefaultAzureCredential()
+    account_url = f"https://{account_name}.blob.core.windows.net"
+    return BlobServiceClient(account_url, credential=credential)
+
+
+def _ensure_container(blob_service: BlobServiceClient, container: str):
+    container_client = blob_service.get_container_client(container)
+    try:
+        container_client.create_container()
+    except Exception:
+        # likely already exists
+        pass
+
+
+def _generate_sas_url(blob_service: BlobServiceClient, container: str, blob_name: str, expiry_hours: int = 1) -> Tuple[str, str]:
+    """
+    Generate a SAS URL for uploading a blob. Supports both account key and user delegation key.
+    Returns (upload_url, blob_name).
+    """
+    expiry = datetime.utcnow() + timedelta(hours=expiry_hours)
+    account_name = blob_service.account_name
+
+    sas_token = None
+    # Try account key first (connection string case)
+    credential = getattr(blob_service, "credential", None)
+    account_key = getattr(credential, "account_key", None)
+
+    if account_key:
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container,
+            blob_name=blob_name,
+            account_key=account_key,
+            permission=BlobSasPermissions(write=True, create=True),
+            expiry=expiry,
+        )
+    else:
+        # Managed Identity path: use user delegation key
+        delegation_key = blob_service.get_user_delegation_key(datetime.utcnow(), expiry)
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=container,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(write=True, create=True),
+            expiry=expiry,
+        )
+
+    blob_client = blob_service.get_blob_client(container=container, blob=blob_name)
+    upload_url = f"{blob_client.url}?{sas_token}"
+    return upload_url, blob_name
+
+
+def _safe_blob_name(filename: str) -> str:
+    base = os.path.basename(filename)
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return f"{uuid.uuid4()}-{base}"
+
+
+def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        texts = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            texts.append(page_text)
+        content = "\n".join(texts).strip()
+        if not content:
+            raise ValueError("No text extracted from PDF")
+        return content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read PDF {filename}: {e}")
+
+
+def _chunk_text(text: str, max_tokens: int = 350, overlap: int = 60, max_chunks: int = 200) -> List[str]:
+    """
+    Simple token-based chunker using tiktoken. Returns a list of chunk strings.
+    """
+    encoder = tiktoken.get_encoding("cl100k_base")
+    tokens = encoder.encode(text)
+    chunks = []
+    start = 0
+    while start < len(tokens) and len(chunks) < max_chunks:
+        end = min(start + max_tokens, len(tokens))
+        chunk_tokens = tokens[start:end]
+        chunks.append(encoder.decode(chunk_tokens))
+        if end == len(tokens):
+            break
+        start = end - overlap
+    return chunks
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    denom = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    if denom == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / denom
+
+
+async def _build_attachment_context(blobs: List[dict], query: str, client: AzureOpenAI) -> List[str]:
+    """
+    Download, chunk, embed attachments and return top chunks as context strings.
+    """
+    if not blobs:
+        return []
+    if not EMBEDDING_DEPLOYMENT:
+        raise HTTPException(status_code=500, detail="Embedding deployment not configured")
+
+    if len(blobs) > MAX_ATTACHMENT_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files. Max {MAX_ATTACHMENT_FILES}.")
+
+    storage = LegalDocsStorage()
+    all_chunks = []
+
+    for blob in blobs:
+        blob_name = blob.get("blob_name")
+        original_filename = blob.get("original_filename", "file.pdf")
+        if not blob_name:
+            continue
+        file_bytes = b""
+        try:
+            file_bytes = storage.download_file(blob_name)
+            if len(file_bytes) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {MAX_UPLOAD_SIZE_MB}MB limit.")
+
+            if original_filename.lower().endswith(".pdf"):
+                text = _extract_text_from_pdf(file_bytes, original_filename)
+            elif original_filename.lower().endswith(".txt"):
+                text = file_bytes.decode("utf-8", errors="ignore")
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file type for {original_filename}. Use PDF or TXT.")
+
+            chunks = _chunk_text(text)
+            for c in chunks:
+                all_chunks.append({
+                    "text": c,
+                    "source": original_filename
+                })
+        finally:
+            # Delete the blob regardless of processing outcome (best-effort)
+            storage.delete_file(blob_name)
+
+    if not all_chunks:
+        return []
+
+    # Embed query (force plain strings to avoid SDK datatype errors)
+    safe_query = str(query or "legal question")
+    print("EMBED INPUT TYPE:", type(safe_query), file=sys.stderr)
+    print("EMBED INPUT PREVIEW:", repr(safe_query)[:500], file=sys.stderr)
+
+    query_embed_resp = client.embeddings.create(
+        model=EMBEDDING_DEPLOYMENT,
+        input=[safe_query]
+    )
+    query_vec = query_embed_resp.data[0].embedding
+
+    # Embed chunks in batches
+    chunk_texts = [str(c["text"]) for c in all_chunks]
+    embed_resp = client.embeddings.create(
+        model=EMBEDDING_DEPLOYMENT,
+        input=chunk_texts
+    )
+    scored = []
+    for chunk_obj, emb in zip(all_chunks, embed_resp.data):
+        score = _cosine_similarity(query_vec, emb.embedding)
+        scored.append((score, chunk_obj))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:5]
+    contexts = []
+    for idx, (score, chunk_obj) in enumerate(top, start=1):
+        contexts.append(f"[Attachment: {chunk_obj['source']}] {chunk_obj['text']}")
+    return contexts
 
 
 # ============== Tool Execution Functions ==============
@@ -205,6 +502,7 @@ async def execute_search_emails(token: str, query: str, limit: int = 10) -> dict
     try:
         async with httpx.AsyncClient() as client:
             url = f"https://graph.microsoft.com/v1.0/me/messages?$search=\"{query}\"&$top={limit}&$select=id,subject,from,receivedDateTime,bodyPreview,hasAttachments"
+            print(f"[Graph] search_emails url={url}", file=sys.stderr)
             
             response = await client.get(
                 url,
@@ -213,6 +511,7 @@ async def execute_search_emails(token: str, query: str, limit: int = 10) -> dict
             )
             
             if response.status_code != 200:
+                print(f"[Graph] search_emails failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
                 return {"error": f"Failed to search emails: {response.status_code}"}
             
             data = response.json()
@@ -238,6 +537,7 @@ async def execute_get_email_content(token: str, message_id: str) -> dict:
     """Get full email content."""
     try:
         async with httpx.AsyncClient() as client:
+            print(f"[Graph] get_email_content id={message_id}", file=sys.stderr)
             response = await client.get(
                 f"https://graph.microsoft.com/v1.0/me/messages/{message_id}?$select=id,subject,from,toRecipients,receivedDateTime,body",
                 headers={"Authorization": f"Bearer {token}"},
@@ -245,6 +545,7 @@ async def execute_get_email_content(token: str, message_id: str) -> dict:
             )
             
             if response.status_code != 200:
+                print(f"[Graph] get_email_content failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
                 return {"error": f"Failed to get email: {response.status_code}"}
             
             msg = response.json()
@@ -274,6 +575,7 @@ async def execute_search_calendar(token: str, query: str = "", days_ahead: int =
         
         async with httpx.AsyncClient() as client:
             url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start.isoformat()}Z&endDateTime={end.isoformat()}Z&$select=id,subject,start,end,location,organizer,isAllDay&$orderby=start/dateTime&$top=50"
+            print(f"[Graph] search_calendar url={url} query={query}", file=sys.stderr)
             
             response = await client.get(
                 url,
@@ -282,6 +584,7 @@ async def execute_search_calendar(token: str, query: str = "", days_ahead: int =
             )
             
             if response.status_code != 200:
+                print(f"[Graph] search_calendar failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
                 return {"error": f"Failed to search calendar: {response.status_code}"}
             
             data = response.json()
@@ -320,6 +623,7 @@ async def execute_get_todays_events(token: str) -> dict:
         
         async with httpx.AsyncClient() as client:
             url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start.isoformat()}Z&endDateTime={end.isoformat()}Z&$select=id,subject,start,end,location,organizer,isAllDay&$orderby=start/dateTime"
+            print(f"[Graph] get_todays_events url={url}", file=sys.stderr)
             
             response = await client.get(
                 url,
@@ -328,6 +632,7 @@ async def execute_get_todays_events(token: str) -> dict:
             )
             
             if response.status_code != 200:
+                print(f"[Graph] get_todays_events failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
                 return {"error": f"Failed to get calendar: {response.status_code}"}
             
             data = response.json()
@@ -355,6 +660,7 @@ async def execute_search_files(token: str, query: str) -> dict:
     """Search OneDrive files."""
     try:
         async with httpx.AsyncClient() as client:
+            print(f"[Graph] search_files query={query}", file=sys.stderr)
             response = await client.get(
                 f"https://graph.microsoft.com/v1.0/me/drive/root/search(q='{query}')?$select=id,name,webUrl,createdDateTime,size,file,folder&$top=20",
                 headers={"Authorization": f"Bearer {token}"},
@@ -362,6 +668,7 @@ async def execute_search_files(token: str, query: str) -> dict:
             )
             
             if response.status_code != 200:
+                print(f"[Graph] search_files failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
                 return {"error": f"Failed to search files: {response.status_code}"}
             
             data = response.json()
@@ -386,6 +693,7 @@ async def execute_search_files(token: str, query: str) -> dict:
 async def execute_tool(tool_name: str, arguments: dict, token: str) -> str:
     """Execute a tool and return the result as a string."""
     try:
+        print(f"execute_tool start tool={tool_name} args_keys={list(arguments.keys())} token_present={bool(token)}", file=sys.stderr)
         if tool_name == "search_emails":
             result = await execute_search_emails(
                 token,
@@ -413,9 +721,11 @@ async def execute_tool(tool_name: str, arguments: dict, token: str) -> str:
         else:
             result = {"error": f"Unknown tool: {tool_name}"}
         
+        print(f"execute_tool result tool={tool_name} keys={list(result.keys())}", file=sys.stderr)
         return json.dumps(result, indent=2)
         
     except Exception as e:
+        print(f"execute_tool error tool={tool_name}: {e}", file=sys.stderr)
         return json.dumps({"error": str(e)})
 
 
@@ -532,6 +842,66 @@ async def box_status(request: Request):
         "message": "Box integration not configured"
     })
 
+def normalize_to_text(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="ignore")
+    if isinstance(x, list):
+        # ex: [{"type":"text","text":"..."}, ...]
+        parts = []
+        for it in x:
+            if isinstance(it, str):
+                parts.append(it)
+            elif isinstance(it, dict):
+                # padrões comuns
+                if "text" in it and isinstance(it["text"], str):
+                    parts.append(it["text"])
+                elif it.get("type") == "text" and isinstance(it.get("text"), str):
+                    parts.append(it["text"])
+        return "\n".join([p for p in parts if p])
+    if isinstance(x, dict):
+        # fallback: tenta pegar campos comuns
+        if "text" in x and isinstance(x["text"], str):
+            return x["text"]
+        if "content" in x:
+            return normalize_to_text(x["content"])
+        return ""
+    return str(x)
+
+
+
+@app.post("/api/get-upload-url")
+async def get_upload_url(request: Request):
+    """Return a SAS URL for uploading a single blob (up to MAX_UPLOAD_SIZE_MB)."""
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        data = await request.json()
+        filename = (data.get("filename") or "").strip()
+        if not filename:
+            raise HTTPException(status_code=400, detail="filename is required")
+
+        container = os.getenv("UPLOAD_CONTAINER", "legal-docs-raw")
+        blob_service = _get_blob_service_client()
+        _ensure_container(blob_service, container)
+
+        blob_name = _safe_blob_name(filename)
+        upload_url, final_blob_name = _generate_sas_url(blob_service, container, blob_name)
+
+        return JSONResponse({
+            "upload_url": upload_url,
+            "blob_name": final_blob_name,
+            "max_size_mb": MAX_UPLOAD_SIZE_MB
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/conversation")
 @app.post("/api/agentic")
@@ -564,30 +934,133 @@ async def conversation(request: Request):
         
         # Get Azure OpenAI credentials
         key = os.getenv("AZURE_OPENAI_KEY")
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "model-router")
+        raw_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
+        search_service = os.getenv("AZURE_SEARCH_SERVICE")
+        search_index = os.getenv("AZURE_SEARCH_INDEX")
+        search_key = os.getenv("AZURE_SEARCH_KEY")
+        # Normalize: SDK needs base endpoint (no path). Version: prefer EMBEDDING, then API, then query, then default.
+        endpoint = raw_endpoint
+        version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
         
         print(f"Endpoint: {endpoint}", file=sys.stderr)
         print(f"Deployment: {deployment}", file=sys.stderr)
         print(f"Key present: {bool(key)}", file=sys.stderr)
+        print(f"Search cfg present: service={bool(search_service)} index={bool(search_index)} key={bool(search_key)}", file=sys.stderr)
         
         if not key or not endpoint:
             raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
         
         # Get Graph token for M365 access
+        auth_headers = {
+            "X-MS-CLIENT-PRINCIPAL": bool(request.headers.get("X-MS-CLIENT-PRINCIPAL")),
+            "X-MS-TOKEN-AAD-ACCESS-TOKEN": bool(request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN")),
+            "X-MS-TOKEN-AAD-ID-TOKEN": bool(request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")),
+        }
+        print(f"Auth headers presence: {auth_headers}", file=sys.stderr)
         graph_token = get_graph_token(request)
+        print(f"Graph token available for tools: {bool(graph_token)}", file=sys.stderr)
         
         print("Creating AzureOpenAI client...", file=sys.stderr)
         client = AzureOpenAI(
             api_key=key,
             azure_endpoint=endpoint,
-            api_version="2024-10-21"
+            api_version=version,
         )
         print("Client created, making request...", file=sys.stderr)
         
         # Build messages with system prompt
         chat_messages = [{"role": "system", "content": JOOGNI_SYSTEM_PROMPT}]
         
+        last_user = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_user = msg.get("content", "")
+                break
+
+        legal_mode = False
+        context_chunks = []
+        no_context = False
+        attachment_contexts: List[str] = []
+        if search_service and search_index and search_key and last_user:
+            try:
+                search_endpoint = f"https://{search_service}.search.windows.net"
+                search_client = SearchClient(
+                    search_endpoint, search_index, AzureKeyCredential(search_key)
+                )
+
+                # Candidate domains: from payload ("domains") or ENV (LEGAL_DOMAINS)
+                request_domains = data.get("domains", [])
+                if isinstance(request_domains, str):
+                    request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
+                elif not isinstance(request_domains, list):
+                    request_domains = []
+
+                candidates = request_domains or LEGAL_DOMAINS
+                candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
+
+                last_user = normalize_to_text(last_user)
+
+                print(f"Running multi-domain search for query='{last_user}' domains={candidates}", file=sys.stderr)
+                context_chunks, domains_with_hits = run_multi_domain_search(
+                    search_client=search_client,
+                    query=last_user,
+                    domains=candidates,
+                    max_domains=LEGAL_MAX_DOMAINS,
+                    top_per_domain=LEGAL_TOP_PER_DOMAIN,
+                )
+
+                legal_mode = len(context_chunks) > 0
+                print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
+                if legal_mode:
+                    ctx = "\n\n".join(context_chunks)
+                    chat_messages.append({
+                        "role": "user",
+                        "content": (
+                            "Use only the context below (tagged por DOMAIN). "
+                            "Cite the sources. If context is insufficient, reply exactly: "
+                            "'I don't have enough information to answer that question.'\n"
+                            + ctx
+                        )
+                    })
+                    print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
+                else:
+                    no_context = True
+                    print("Legal RAG skipped (no relevant search hits); instructing model to say no context", file=sys.stderr)
+            except Exception as search_err:
+                print(f"Legal RAG search error: {search_err}", file=sys.stderr)
+        else:
+            print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
+
+        # Attachments uploaded by user (PDF/TXT) for this request
+        blobs = data.get("blobs", [])
+        if blobs:
+            try:
+                attachment_contexts = await _build_attachment_context(blobs, last_user, client)
+            except HTTPException:
+                raise
+            except Exception as attach_err:
+                print(f"Attachment processing error: {attach_err}", file=sys.stderr)
+                raise HTTPException(status_code=500, detail=f"Attachment processing failed: {attach_err}")
+
+        if attachment_contexts:
+            # We have user-provided context; do not force the model to say "no context"
+            no_context = False
+            chat_messages.append({
+                "role": "user",
+                "content": (
+                    "Use ONLY the following attachment excerpts to answer. "
+                    "Cite them as 'Attachment Source'.\n\n" + "\n\n".join(attachment_contexts)
+                )
+            })
+        
+        # If no relevant context, instruct the model not to invent
+        if no_context:
+            chat_messages.append({
+                "role": "user",
+                "content": "There is no relevant context in the index for this legal question. Respond with 'I don't have enough information to answer that legal question. do not invent information.'. Do not use any other information or sources."
+            })
+
         # Add context if provided
         if context:
             chat_messages.append({
@@ -607,7 +1080,9 @@ async def conversation(request: Request):
             })
         
         print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
-        print(f"Making Azure OpenAI call with tools={bool(graph_token)}...", file=sys.stderr)
+        # lower temperature for legal questions to reduce creativity
+        temperature = 0.2 if legal_mode else 0.7
+        print(f"Making Azure OpenAI call with tools={bool(graph_token)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
         
         # First call - may request tool use
         try:
@@ -616,7 +1091,7 @@ async def conversation(request: Request):
                 messages=chat_messages,
                 tools=TOOLS if graph_token else None,
                 tool_choice="auto" if graph_token else None,
-                temperature=0.7,
+                temperature=temperature,
                 max_tokens=2000
             )
             print(f"Azure OpenAI response received!", file=sys.stderr)
@@ -696,6 +1171,40 @@ async def conversation(request: Request):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/graph/health")
+async def graph_health(request: Request):
+    """
+    Lightweight Graph diagnostic: checks /me and one messages fetch using the token from Easy Auth.
+    """
+    token = get_graph_token(request)
+    if not token:
+        return JSONResponse({"error": "Missing Graph token"}, status_code=401)
+    
+    results = {}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for name, url in [
+            ("me", "https://graph.microsoft.com/v1.0/me"),
+            ("messages", "https://graph.microsoft.com/v1.0/me/messages?$top=1&$select=id,subject"),
+        ]:
+            try:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = resp.text[:500]
+                results[name] = {
+                    "status": resp.status_code,
+                    "ok": resp.status_code < 300,
+                    "payload_preview": payload if resp.status_code >= 300 else None,
+                }
+                print(f"[Graph health] {name} status={resp.status_code}", file=sys.stderr)
+            except Exception as err:
+                results[name] = {"status": None, "ok": False, "error": str(err)}
+                print(f"[Graph health] {name} error: {err}", file=sys.stderr)
+    
+    return JSONResponse({"results": results})
 
 
 @app.get("/api/check_status/{request_id}")
