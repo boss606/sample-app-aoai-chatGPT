@@ -321,7 +321,12 @@ def _get_token_expiry(request: Request) -> Optional[int]:
     try:
         return int(expires_on)
     except Exception:
-        return None
+        # Some environments send ISO strings like 2026-01-26T23:07:48.0666466Z
+        try:
+            iso = expires_on.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(iso).timestamp())
+        except Exception:
+            return None
 
 
 def _token_near_expiry(expiry: Optional[int], skew_seconds: int = 300) -> bool:
@@ -588,18 +593,25 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
 
 # ============== Tool Execution Functions ==============
 
-async def execute_search_emails(token: str, query: str, limit: int = 10) -> dict:
+async def execute_search_emails(token: str, query: str, limit: int = 10, request: Optional[Request] = None) -> dict:
     """Execute email search via Microsoft Graph."""
     try:
         async with httpx.AsyncClient() as client:
             url = f"https://graph.microsoft.com/v1.0/me/messages?$search=\"{query}\"&$top={limit}&$select=id,subject,from,receivedDateTime,bodyPreview,hasAttachments"
             print(f"[Graph] search_emails url={url}", file=sys.stderr)
             
-            response = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0
-            )
+            headers = {"Authorization": f"Bearer {token}"}
+            response = await client.get(url, headers=headers, timeout=30.0)
+            
+            # If token expired, try one refresh + retry (best effort)
+            if response.status_code == 401 and request:
+                print("[Graph] search_emails 401; attempting token refresh + retry", file=sys.stderr)
+                refreshed = await refresh_graph_token(request)
+                if refreshed:
+                    headers = {"Authorization": f"Bearer {refreshed}"}
+                    response = await client.get(url, headers=headers, timeout=30.0)
+                    token = refreshed  # use refreshed token for parsing below
+                    print(f"[Graph] search_emails retry status={response.status_code}", file=sys.stderr)
             
             if response.status_code != 200:
                 print(f"[Graph] search_emails failed status={response.status_code} body={response.text[:300]}", file=sys.stderr)
@@ -781,7 +793,7 @@ async def execute_search_files(token: str, query: str) -> dict:
         return {"error": str(e)}
 
 
-async def execute_tool(tool_name: str, arguments: dict, token: str) -> str:
+async def execute_tool(tool_name: str, arguments: dict, token: str, request: Optional[Request] = None) -> str:
     """Execute a tool and return the result as a string."""
     try:
         print(f"execute_tool start tool={tool_name} args_keys={list(arguments.keys())} token_present={bool(token)}", file=sys.stderr)
@@ -789,7 +801,8 @@ async def execute_tool(tool_name: str, arguments: dict, token: str) -> str:
             result = await execute_search_emails(
                 token,
                 arguments.get("query", ""),
-                arguments.get("limit", 10)
+                arguments.get("limit", 10),
+                request=request,
             )
         elif tool_name == "get_email_content":
             result = await execute_get_email_content(
@@ -1217,7 +1230,7 @@ async def conversation(request: Request):
                 function_args = json.loads(tool_call.function.arguments)
                 
                 # Execute the tool
-                tool_result = await execute_tool(function_name, function_args, graph_token)
+                tool_result = await execute_tool(function_name, function_args, graph_token, request)
                 
                 # Add tool result to messages
                 chat_messages.append({
