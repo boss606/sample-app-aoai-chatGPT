@@ -13,8 +13,9 @@ import base64
 import re
 import httpx
 import uuid
+import time
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -294,20 +295,110 @@ def is_authenticated(request: Request) -> bool:
     return bool(principal or id_token)
 
 
-def get_graph_token(request: Request) -> str:
+def get_graph_token(request: Request) -> Optional[str]:
     """Get Microsoft Graph access token from Easy Auth."""
     token = request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN")
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
+    expires_on = request.headers.get("X-MS-TOKEN-AAD-EXPIRES-ON")
     print(
         "Graph token presence: "
         f"access={bool(token)} len={len(token) if token else 0} "
-        f"principal={bool(principal)} id_token={bool(id_token)}",
+        f"principal={bool(principal)} id_token={bool(id_token)} "
+        f"expires_on={expires_on}",
         file=sys.stderr,
     )
     if token:
         print(f"Graph token prefix: {token[:10]}...", file=sys.stderr)
     return token or None
+
+
+def _get_token_expiry(request: Request) -> Optional[int]:
+    """Return token expiry (epoch seconds) from Easy Auth header."""
+    expires_on = request.headers.get("X-MS-TOKEN-AAD-EXPIRES-ON")
+    if not expires_on:
+        return None
+    try:
+        return int(expires_on)
+    except Exception:
+        return None
+
+
+def _token_near_expiry(expiry: Optional[int], skew_seconds: int = 300) -> bool:
+    """True if expiry is within skew window."""
+    if not expiry:
+        return False
+    now = int(time.time())
+    return expiry - now <= skew_seconds
+
+
+async def refresh_graph_token(request: Request) -> Optional[str]:
+    """
+    Attempt to refresh Easy Auth tokens via /.auth/refresh using the caller's cookies.
+    Returns a new access token if present in the response.
+    """
+    cookies = request.headers.get("cookie")
+    if not cookies:
+        print("[Graph token] No cookies on request; cannot refresh.", file=sys.stderr)
+        return None
+
+    refresh_url = str(request.base_url).rstrip("/") + "/.auth/refresh"
+    try:
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            resp = await client.get(
+                refresh_url,
+                headers={"cookie": cookies},
+                timeout=10.0,
+            )
+    except Exception as err:
+        print(f"[Graph token] Refresh call failed: {err}", file=sys.stderr)
+        return None
+
+    if resp.status_code not in (200, 302):
+        print(
+            f"[Graph token] Refresh failed status={resp.status_code} body={resp.text[:200]}",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as err:
+        print(f"[Graph token] Refresh JSON parse error: {err}", file=sys.stderr)
+        return None
+
+    if not isinstance(data, dict):
+        print("[Graph token] Refresh response not a dict; cannot extract token.", file=sys.stderr)
+        return None
+
+    new_token = (
+        data.get("access_token")
+        or data.get("access_token_v2")
+        or data.get("authenticationToken")
+    )
+    print(
+        f"[Graph token] Refresh success token_present={bool(new_token)} "
+        f"expires_on={data.get('expires_on')}",
+        file=sys.stderr,
+    )
+    return new_token
+
+
+async def get_valid_graph_token(request: Request, refresh_skew_seconds: int = 300) -> Optional[str]:
+    """
+    Return a usable Graph token, attempting refresh if the Easy Auth token is close to expiry.
+    """
+    token = get_graph_token(request)
+    expiry = _get_token_expiry(request)
+    if token and not _token_near_expiry(expiry, refresh_skew_seconds):
+        return token
+
+    refreshed = await refresh_graph_token(request)
+    if refreshed:
+        return refreshed
+
+    # Fall back to whatever we had (may be None / expired)
+    return token
 
 
 def _get_blob_service_client() -> BlobServiceClient:
@@ -958,7 +1049,7 @@ async def conversation(request: Request):
             "X-MS-TOKEN-AAD-ID-TOKEN": bool(request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")),
         }
         print(f"Auth headers presence: {auth_headers}", file=sys.stderr)
-        graph_token = get_graph_token(request)
+        graph_token = await get_valid_graph_token(request)
         print(f"Graph token available for tools: {bool(graph_token)}", file=sys.stderr)
         
         print("Creating AzureOpenAI client...", file=sys.stderr)
@@ -1178,7 +1269,7 @@ async def graph_health(request: Request):
     """
     Lightweight Graph diagnostic: checks /me and one messages fetch using the token from Easy Auth.
     """
-    token = get_graph_token(request)
+    token = await get_valid_graph_token(request)
     if not token:
         return JSONResponse({"error": "Missing Graph token"}, status_code=401)
     
@@ -1264,7 +1355,7 @@ async def analyze_document(request: Request, file: UploadFile = File(...)):
 async def search_emails_direct(request: Request, q: str = "", top: int = 20):
     """Search Outlook emails (direct API for M365 panel)."""
     try:
-        token = get_graph_token(request)
+        token = await get_valid_graph_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="No access token available")
         
@@ -1294,7 +1385,7 @@ async def search_emails_direct(request: Request, q: str = "", top: int = 20):
 async def get_email_direct(request: Request, message_id: str):
     """Get full email content (direct API for M365 panel)."""
     try:
-        token = get_graph_token(request)
+        token = await get_valid_graph_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="No access token available")
         
@@ -1319,7 +1410,7 @@ async def get_email_direct(request: Request, message_id: str):
 async def search_calendar_direct(request: Request, q: str = "", days: int = 30):
     """Search calendar events (direct API for M365 panel)."""
     try:
-        token = get_graph_token(request)
+        token = await get_valid_graph_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="No access token available")
         
@@ -1359,7 +1450,7 @@ async def search_calendar_direct(request: Request, q: str = "", days: int = 30):
 async def search_onedrive_direct(request: Request, q: str):
     """Search OneDrive files (direct API for M365 panel)."""
     try:
-        token = get_graph_token(request)
+        token = await get_valid_graph_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="No access token available")
         
