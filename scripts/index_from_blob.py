@@ -16,6 +16,8 @@ import os
 import sys
 import re
 import json
+import tempfile
+import mmap
 from pathlib import Path
 from typing import List, Iterable, Tuple
 
@@ -29,8 +31,6 @@ if str(ROOT_DIR) not in sys.path:
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
-from azure.ai.formrecognizer import DocumentAnalysisClient
-
 from backend.storage.blob_storage import LegalDocsStorage
 from scripts.prepdocs import create_search_index, upload_documents_to_index
 from scripts.data_utils import chunk_content, Document
@@ -49,10 +49,8 @@ LEGAL_DOMAIN = os.getenv("LEGAL_DOMAIN", "").strip()
 AZURE_BASE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-FORM_ENDPOINT = os.getenv("FORM_RECOGNIZER_ENDPOINT")
-FORM_KEY = os.getenv("FORM_RECOGNIZER_KEY")
 SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
-SUPPORTED_EXTENSIONS = (".txt", ".pdf")
+SUPPORTED_EXTENSIONS = (".txt",)
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 
@@ -123,6 +121,42 @@ CASE_HEADING_RE = re.compile(
 TOKENS_SECTION_OR_CASE = 4000  # keep sections/cases intact whenever possible
 TOKENS_DEFAULT = 800
 TOKENS_SUBSECTION = 1200  # sub-chunk large sections
+UPLOAD_BATCH_SIZE = int(os.getenv("UPLOAD_BATCH_SIZE", "128"))
+
+
+def estimate_batch_bytes(batch: List[Document]) -> int:
+    """Rough byte size estimate of a batch for logging/monitoring."""
+    total = 0
+    for c in batch:
+        try:
+            total += len(c.content.encode("utf-8"))
+        except Exception:
+            total += len(c.content)
+        if c.metadata:
+            if isinstance(c.metadata, str):
+                total += len(c.metadata.encode("utf-8"))
+            else:
+                try:
+                    total += len(json.dumps(c.metadata))
+                except Exception:
+                    pass
+        if c.title:
+            total += len(c.title.encode("utf-8"))
+        if c.url:
+            total += len(c.url.encode("utf-8"))
+        if c.contentVector:
+            try:
+                total += len(json.dumps(c.contentVector))
+            except Exception:
+                pass
+    return total
+
+
+def make_chunk_id(file_name: str, chunk_idx: int) -> str:
+    """Generate a Search-safe document key (letters/digits/_/-/= only)."""
+    stem = Path(file_name).stem
+    safe_stem = re.sub(r"[^A-Za-z0-9_\-=]", "-", stem)
+    return f"{safe_stem}-{chunk_idx}"
 
 
 def _find_markers(text: str, patterns: Iterable[re.Pattern]) -> List[int]:
@@ -192,13 +226,6 @@ def _require(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
     return value
-
-
-def pdf_bytes_to_text(data: bytes, client: DocumentAnalysisClient) -> str:
-    """Extract text from PDF using Form Recognizer (prebuilt-layout)."""
-    poller = client.begin_analyze_document("prebuilt-layout", document=data)
-    result = poller.result()
-    return "\n".join([p.content for p in result.paragraphs])
 
 
 def add_domain_metadata(chunks: List[Document], source_name: str, domain: str = "family_code"):
@@ -322,16 +349,38 @@ def infer_domain_from_blob(name: str) -> str:
     return lower_stem.strip()
 
 
-def bytes_to_text(name: str, data: bytes, form_client: DocumentAnalysisClient | None) -> tuple[str, bool]:
-    """Convert blob bytes to text. Returns text and a flag indicating if it was PDF."""
-    is_pdf = name.lower().endswith(".pdf")
-    if is_pdf:
-        if not form_client:
-            raise ValueError("Form Recognizer client is required for PDFs")
-        text = pdf_bytes_to_text(data, form_client)
-    else:
-        text = data.decode("utf-8", errors="replace")
-    return text, is_pdf
+def bytes_to_text(name: str, data: bytes) -> tuple[str, bool]:
+    """Convert blob bytes to text. Only TXT is supported here; PDF path removed."""
+    text = data.decode("utf-8", errors="replace")
+    return text, False
+
+
+def download_blob_to_temp(storage: LegalDocsStorage, blob_name: str, chunk_size: int = 16 * 1024 * 1024) -> str:
+    """
+    Stream a blob to a temporary file to avoid holding the entire payload in memory.
+    Returns the temporary file path (caller is responsible for deletion).
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp_path = tmp.name
+    try:
+        blob_client = storage.blob_service.get_blob_client(
+            container=storage.raw_container,
+            blob=blob_name,
+        )
+        # Some SDK versions don't accept chunk_size on chunks(); rely on default chunking.
+        stream = blob_client.download_blob()
+        for part in stream.chunks():
+            tmp.write(part)
+        tmp.flush()
+        tmp.close()
+        return tmp_path
+    except Exception:
+        tmp.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def extract_decision_date(text: str) -> str | None:
@@ -353,19 +402,9 @@ def main():
     storage = LegalDocsStorage()
     blobs = storage.list_documents(extensions=SUPPORTED_EXTENSIONS)
 
-    pdf_blobs = [b for b in blobs if b.lower().endswith(".pdf")]
-    txt_blobs = [b for b in blobs if b.lower().endswith(".txt")]
-
-    if pdf_blobs:
-        form_endpoint = _require(FORM_ENDPOINT, "FORM_RECOGNIZER_ENDPOINT")
-        form_key = _require(FORM_KEY, "FORM_RECOGNIZER_KEY")
-        form_client = DocumentAnalysisClient(form_endpoint, AzureKeyCredential(form_key))
-    else:
-        form_client = None
-
     print(
         f"Found {len(blobs)} document(s) in {storage.raw_container} "
-        f"({len(pdf_blobs)} PDF, {len(txt_blobs)} TXT)"
+        f"({len(blobs)} TXT)"
     )
 
     search_endpoint = f"https://{SEARCH_SERVICE}.search.windows.net"
@@ -381,9 +420,14 @@ def main():
         print(f"Processing {name} ...")
         success = False
         for attempt in range(10):
+            tmp_path = None
             try:
-                file_bytes = storage.download_file(name)
-                text, is_pdf = bytes_to_text(name, file_bytes, form_client)
+                # Stream download to temp file to avoid holding the blob in memory
+                tmp_path = download_blob_to_temp(storage, name)
+
+                with open(tmp_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    # mmap avoids an extra Python-level buffer; decode later in bytes_to_text
+                    text, _ = bytes_to_text(name, mm[:])
 
                 # Determine domain: LEGAL_DOMAIN takes precedence; otherwise infer from blob name
                 domain_for_blob = LEGAL_DOMAIN or infer_domain_from_blob(name)
@@ -393,10 +437,11 @@ def main():
                     )
 
                 blocks = split_legal_blocks(text, domain_for_blob)
-                file_name_for_chunks = None if is_pdf else name
+                file_name_for_chunks = name
 
-                file_chunks: List[Document] = []
                 chunk_idx = 0
+                batch: List[Document] = []
+                chunks_for_file = 0
                 for block in blocks:
                     has_section = SECTION_RE.search(block) is not None
                     has_case = CASE_RE.search(block) is not None
@@ -451,24 +496,46 @@ def main():
                             else:
                                 meta["doc_type"] = "case"
 
+                            # stable, search-safe id per chunk to avoid overwrites and invalid keys
+                            chunk.id = make_chunk_id(name, chunk_idx)
                             chunk.metadata = json.dumps(meta)
                             chunk_idx += 1
 
-                        file_chunks.extend(result.chunks)
+                        batch.extend(result.chunks)
+                        chunks_for_file += len(result.chunks)
+                        # Upload in small batches to avoid holding all chunks in memory
+                        if len(batch) >= UPLOAD_BATCH_SIZE:
+                            est_bytes = estimate_batch_bytes(batch)
+                            print(f"Uploading batch of {len(batch)} chunk(s) for {name} to index {INDEX_NAME} (~{est_bytes / (1024 * 1024):.2f} MB) ...")
+                            upload_documents_to_index(batch, search_client)
+                            total_chunks += len(batch)
+                            batch.clear()
+
                         print(f" -> {len(result.chunks)} chunk(s) in block (sub)")
 
-                if not file_chunks:
+                # Flush any remaining chunks for this file
+                if batch:
+                    est_bytes = estimate_batch_bytes(batch)
+                    print(f"Uploading final batch of {len(batch)} chunk(s) for {name} to index {INDEX_NAME} (~{est_bytes / (1024 * 1024):.2f} MB) ...")
+                    upload_documents_to_index(batch, search_client)
+                    total_chunks += len(batch)
+                    batch.clear()
+
+                if chunks_for_file == 0:
                     print(f"No chunks for {name}; skipping upload.")
                     success = True
                     break
 
-                total_chunks += len(file_chunks)
-                print(f"Uploading {len(file_chunks)} chunk(s) for {name} to index {INDEX_NAME} ...")
-                upload_documents_to_index(file_chunks, search_client)
                 success = True
                 break
             except Exception as file_err:
                 print(f"Error processing {name} (attempt {attempt + 1}/3): {file_err}")
+            finally:
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
         if not success:
             failed_files += 1
 

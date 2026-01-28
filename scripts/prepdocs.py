@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import time
+import uuid
 
 from tqdm import tqdm
 from azure.identity import AzureDeveloperCliCredential
@@ -91,11 +92,11 @@ def create_search_index(index_name, index_client):
 def upload_documents_to_index(docs, search_client, upload_batch_size=50):
     to_upload_dicts = []
 
-    id = 0
     for document in docs:
         d = dataclasses.asdict(document)
-        # add id to documents
-        d.update({"@search.action": "upload", "id": str(id)})
+        # prefer existing id to avoid overwriting across batches
+        doc_id = document.id if getattr(document, "id", None) else str(uuid.uuid4())
+        d.update({"@search.action": "upload", "id": str(doc_id)})
         # propagate domain from metadata to top-level field expected by schema
         if not d.get("domain"):
             meta = d.get("metadata")
@@ -107,7 +108,6 @@ def upload_documents_to_index(docs, search_client, upload_batch_size=50):
         if "image_mapping" in d:
             del d["image_mapping"]
         to_upload_dicts.append(d)
-        id += 1
 
     # Upload the documents in batches of upload_batch_size
     for i in tqdm(

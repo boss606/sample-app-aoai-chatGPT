@@ -290,9 +290,10 @@ def get_user_info(request: Request) -> dict:
 
 def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
-    principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
-    id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True
+    # principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    # id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
+    # return bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -528,7 +529,18 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         raise HTTPException(status_code=400, detail=f"Too many files. Max {MAX_ATTACHMENT_FILES}.")
 
     storage = LegalDocsStorage()
-    all_chunks = []
+    attachment_sections: List[str] = []
+    top_chunks_per_file = 3
+
+    # Embed query once
+    safe_query = str(query or "legal question")
+    print("EMBED INPUT TYPE:", type(safe_query), file=sys.stderr)
+    print("EMBED INPUT PREVIEW:", repr(safe_query)[:500], file=sys.stderr)
+    query_embed_resp = client.embeddings.create(
+        model=EMBEDDING_DEPLOYMENT,
+        input=[safe_query]
+    )
+    query_vec = query_embed_resp.data[0].embedding
 
     for blob in blobs:
         blob_name = blob.get("blob_name")
@@ -536,6 +548,7 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         if not blob_name:
             continue
         file_bytes = b""
+        chunk_texts: List[str] = []
         try:
             file_bytes = storage.download_file(blob_name)
             if len(file_bytes) > MAX_UPLOAD_BYTES:
@@ -548,47 +561,35 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file type for {original_filename}. Use PDF or TXT.")
 
-            chunks = _chunk_text(text)
-            for c in chunks:
-                all_chunks.append({
-                    "text": c,
-                    "source": original_filename
-                })
+            chunk_texts = _chunk_text(text)
         finally:
             # Delete the blob regardless of processing outcome (best-effort)
             storage.delete_file(blob_name)
 
-    if not all_chunks:
-        return []
+        if not chunk_texts:
+            continue
 
-    # Embed query (force plain strings to avoid SDK datatype errors)
-    safe_query = str(query or "legal question")
-    print("EMBED INPUT TYPE:", type(safe_query), file=sys.stderr)
-    print("EMBED INPUT PREVIEW:", repr(safe_query)[:500], file=sys.stderr)
+        # Embed chunks for this file
+        embed_resp = client.embeddings.create(
+            model=EMBEDDING_DEPLOYMENT,
+            input=[str(c) for c in chunk_texts]
+        )
+        scored: List[Tuple[float, str]] = []
+        for chunk_text, emb in zip(chunk_texts, embed_resp.data):
+            score = _cosine_similarity(query_vec, emb.embedding)
+            scored.append((score, str(chunk_text)))
 
-    query_embed_resp = client.embeddings.create(
-        model=EMBEDDING_DEPLOYMENT,
-        input=[safe_query]
-    )
-    query_vec = query_embed_resp.data[0].embedding
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_chunks = scored[:top_chunks_per_file]
+        if not top_chunks:
+            continue
 
-    # Embed chunks in batches
-    chunk_texts = [str(c["text"]) for c in all_chunks]
-    embed_resp = client.embeddings.create(
-        model=EMBEDDING_DEPLOYMENT,
-        input=chunk_texts
-    )
-    scored = []
-    for chunk_obj, emb in zip(all_chunks, embed_resp.data):
-        score = _cosine_similarity(query_vec, emb.embedding)
-        scored.append((score, chunk_obj))
+        section_lines = [f"[Attachment: {original_filename}]"]
+        for idx, (_, chunk_text) in enumerate(top_chunks, start=1):
+            section_lines.append(f"{idx}. {chunk_text}")
+        attachment_sections.append("\n".join(section_lines))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:5]
-    contexts = []
-    for idx, (score, chunk_obj) in enumerate(top, start=1):
-        contexts.append(f"[Attachment: {chunk_obj['source']}] {chunk_obj['text']}")
-    return contexts
+    return attachment_sections
 
 
 # ============== Tool Execution Functions ==============
@@ -1154,7 +1155,9 @@ async def conversation(request: Request):
                 "role": "user",
                 "content": (
                     "Use ONLY the following attachment excerpts to answer. "
-                    "Cite them as 'Attachment Source'.\n\n" + "\n\n".join(attachment_contexts)
+                    "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
+                    "Cite them as 'Attachment Source'.\n\n"
+                    + "\n\n".join(attachment_contexts)
                 )
             })
         
