@@ -110,11 +110,14 @@ LEGAL_MAX_DOMAINS = int(os.getenv("LEGAL_MAX_DOMAINS", "3"))
 LEGAL_TOP_PER_DOMAIN = int(os.getenv("LEGAL_TOP_PER_DOMAIN", "3"))
 
 # Upload / attachment settings
-# Defaults raised to support uploads com vários PDFs pesados; pode ajustar via env vars.
+# Defaults raised to support uploads with multiple large PDFs; adjust via env vars.
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "20"))
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "200"))
+PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
 
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 print("AZURE_OPENAI_EMBEDDING_DEPLOYMENT present:", bool(deployment_name))
@@ -160,7 +163,7 @@ def run_multi_domain_search(
             # log and continue with other domains
             print(f"Search error for domain {dom}: {e}", file=sys.stderr)
 
-    # Fallback sem filtro se nada encontrado
+    # Fallback without filter if nothing found
     if not context_chunks:
         try:
             results = search_client.search(search_text=query, top=top_per_domain)
@@ -485,9 +488,64 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
             page_text = page.extract_text() or ""
             texts.append(page_text)
         content = "\n".join(texts).strip()
-        if not content:
-            raise ValueError("No text extracted from PDF")
-        return content
+        if content:
+            return content
+
+        page_count = len(reader.pages)
+        if not page_count:
+            raise HTTPException(status_code=400, detail=f"PDF {filename} is empty or has no readable pages.")
+
+        if page_count > PDF_OCR_MAX_PAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PDF {filename} has {page_count} pages; OCR limit is {PDF_OCR_MAX_PAGES}. "
+                    "Upload a smaller file or one with embedded text."
+                ),
+            )
+
+        try:
+            from pdf2image import convert_from_bytes  # type: ignore
+            import pytesseract  # type: ignore
+        except Exception as import_err:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"OCR unavailable for {filename}: install poppler + tesseract on the system and "
+                    f"pdf2image/pytesseract libraries. Error: {import_err}"
+                ),
+            ) from import_err
+
+        images = convert_from_bytes(
+            file_bytes,
+            dpi=PDF_OCR_DPI,
+            first_page=1,
+            last_page=page_count,
+        )
+        ocr_chunks = []
+        for idx, img in enumerate(images, start=1):
+            try:
+                txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
+            except Exception as ocr_err:
+                print(f"OCR failed on page {idx}: {ocr_err}", file=sys.stderr)
+                continue
+            if txt.strip():
+                ocr_chunks.append(txt.strip())
+
+        ocr_content = "\n".join(ocr_chunks).strip()
+        if ocr_content:
+            return ocr_content
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"PDF {filename} appears to be scanned or redacted and OCR found no text. "
+                "Upload a clearer copy or one with embedded OCR text."
+            ),
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read PDF {filename}: {e}")
 
@@ -962,14 +1020,14 @@ def normalize_to_text(x) -> str:
             if isinstance(it, str):
                 parts.append(it)
             elif isinstance(it, dict):
-                # padrões comuns
+                # common patterns
                 if "text" in it and isinstance(it["text"], str):
                     parts.append(it["text"])
                 elif it.get("type") == "text" and isinstance(it.get("text"), str):
                     parts.append(it["text"])
         return "\n".join([p for p in parts if p])
     if isinstance(x, dict):
-        # fallback: tenta pegar campos comuns
+        # fallback: try to pick common fields
         if "text" in x and isinstance(x["text"], str):
             return x["text"]
         if "content" in x:
