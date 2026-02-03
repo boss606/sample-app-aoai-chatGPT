@@ -515,21 +515,37 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
                 ),
             ) from import_err
 
-        images = convert_from_bytes(
-            file_bytes,
-            dpi=PDF_OCR_DPI,
-            first_page=1,
-            last_page=page_count,
-        )
+        # Convert one page at a time to avoid holding every rendered image in memory
+        max_pages = min(page_count, PDF_OCR_MAX_PAGES)
         ocr_chunks = []
-        for idx, img in enumerate(images, start=1):
+        for page_num in range(1, max_pages + 1):
             try:
-                txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
-            except Exception as ocr_err:
-                print(f"OCR failed on page {idx}: {ocr_err}", file=sys.stderr)
+                images = convert_from_bytes(
+                    file_bytes,
+                    dpi=PDF_OCR_DPI,
+                    first_page=page_num,
+                    last_page=page_num,
+                )
+            except Exception as conv_err:
+                print(f"OCR conversion failed on page {page_num}: {conv_err}", file=sys.stderr)
                 continue
-            if txt.strip():
-                ocr_chunks.append(txt.strip())
+
+            for img in images:
+                try:
+                    txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
+                except Exception as ocr_err:
+                    print(f"OCR failed on page {page_num}: {ocr_err}", file=sys.stderr)
+                    continue
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                if txt.strip():
+                    ocr_chunks.append(txt.strip())
+
+            # Explicitly drop page images before the next iteration
+            del images
 
         ocr_content = "\n".join(ocr_chunks).strip()
         if ocr_content:
