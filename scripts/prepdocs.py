@@ -1,5 +1,7 @@
 import argparse
 import dataclasses
+import json
+import os
 import time
 import uuid
 
@@ -52,9 +54,45 @@ def create_search_index(index_name, index_client):
                 SearchableField(name="filepath", type="Edm.String"),
                 SearchableField(name="url", type="Edm.String"),
                 SearchableField(name="metadata", type="Edm.String"),
+                SimpleField(
+                    name="court",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    facetable=True,
+                ),
+                SimpleField(
+                    name="jurisdiction",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    facetable=True,
+                ),
+                SimpleField(
+                    name="state",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    facetable=True,
+                ),
+                SimpleField(
+                    name="source",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                ),
+                SimpleField(
+                    name="date_filed",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    sortable=True,
+                ),
+                SimpleField(
+                    name="doc_type",
+                    type=SearchFieldDataType.String,
+                    filterable=True,
+                    facetable=True,
+                ),
                 SearchField(name="contentVector", type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
                             hidden=False, searchable=True, filterable=False, sortable=False, facetable=False,
-                            vector_search_dimensions=1536, vector_search_profile_name="default"),
+                            vector_search_dimensions=int(os.getenv("VECTOR_DIMENSION", "3072")),
+                            vector_search_profile_name="default"),
             ],
             semantic_search=SemanticSearch(
                 default_configuration_name="default",
@@ -97,11 +135,19 @@ def upload_documents_to_index(docs, search_client, upload_batch_size=50):
         # prefer existing id to avoid overwriting across batches
         doc_id = document.id if getattr(document, "id", None) else str(uuid.uuid4())
         d.update({"@search.action": "upload", "id": str(doc_id)})
-        # propagate domain from metadata to top-level field expected by schema
-        if not d.get("domain"):
-            meta = d.get("metadata")
-            if isinstance(meta, dict) and meta.get("domain"):
+        # propagate domain and filterable fields from metadata to top-level when not set
+        meta = d.get("metadata")
+        if isinstance(meta, str) and meta.strip().startswith("{"):
+            try:
+                meta = json.loads(meta)
+            except json.JSONDecodeError:
+                meta = {}
+        if isinstance(meta, dict):
+            if not d.get("domain") and meta.get("domain"):
                 d["domain"] = meta.get("domain")
+            for key in ("court", "jurisdiction", "state", "source", "date_filed", "doc_type"):
+                if not d.get(key) and meta.get(key):
+                    d[key] = meta.get(key)
         if "contentVector" in d and d["contentVector"] is None:
             del d["contentVector"]
         # Remove image_mapping if present (schema expects string fields only)

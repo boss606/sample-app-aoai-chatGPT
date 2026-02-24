@@ -5,4 +5,13 @@ frontend/node_modules
 .azure/
 __pycache__/
 .ipynb_checkpoints/
-scripts/scrapers/downloads/**/*.txt
+# Downloads folder: ignore contents; keep folder via .gitkeep
+downloads/*
+!downloads/.gitkeep
+
+# Output folders (data_ingestion): ignore contents; keep folders via .gitkeep
+**/output/*
+!**/output/.gitkeep
+
+# index_from_blob checkpoint (machine-specific state)
+.index_checkpoint.json

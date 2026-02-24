@@ -241,7 +241,7 @@ def create_or_update_search_index(
             "searchable": True,
             "retrievable": True,
             "stored": True,
-            "dimensions": int(os.getenv("VECTOR_DIMENSION", 1536)),
+            "dimensions": int(os.getenv("VECTOR_DIMENSION", 3072)),
             "vectorSearchProfile": vector_config_name
         })
 

@@ -16,6 +16,8 @@ import os
 import sys
 import re
 import json
+import time
+import datetime
 import tempfile
 import mmap
 from pathlib import Path
@@ -29,6 +31,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from backend.storage.blob_storage import LegalDocsStorage
@@ -50,9 +53,10 @@ AZURE_BASE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
-SUPPORTED_EXTENSIONS = (".txt",)
+SUPPORTED_EXTENSIONS = (".txt", ".json")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+CHECKPOINT_FILE = ROOT_DIR / ".index_checkpoint.json"
 
 # Simple heuristics to split legal blocks
 SECTION_RE = re.compile(r"^(?:Art\.?|§)\s*\d+[^\n]*", re.IGNORECASE | re.MULTILINE)
@@ -104,6 +108,25 @@ COURTLISTENER_STEM_MAP = {
     "calctapp": "calctapp",
     "scotus_all": "scotus",
     "scotus": "scotus",
+}
+
+# California statute/rule domains (infer state="California" when not set)
+CA_STATUTE_DOMAINS = frozenset({
+    "family_code",
+    "code_of_civil_procedure",
+    "civil_code",
+    "evidence_code",
+    "rules_of_court",
+})
+
+# Court forms domain and known categories
+COURT_FORMS_DOMAIN = "court_forms"
+COURT_FORM_CATEGORIES = {
+    "child_custody_visitation",
+    "child_support",
+    "divorce",
+    "domestic_violence",
+    "parentage",
 }
 
 DECISION_DATE_RE_ISO = re.compile(r"\b(19|20)\d{2}-\d{2}-\d{2}\b")
@@ -228,11 +251,48 @@ def _require(value: str, name: str) -> str:
     return value
 
 
-def add_domain_metadata(chunks: List[Document], source_name: str, domain: str = "family_code"):
-    """Add domain and source metadata."""
+def load_checkpoint(path: Path = CHECKPOINT_FILE) -> dict:
+    """
+    Load checkpoint data from disk.
+    Structure: {"processed_blobs": [...], "last_updated": "..."}.
+    """
+    if not path.exists():
+        return {"processed_blobs": [], "last_updated": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "processed_blobs" not in data or not isinstance(data["processed_blobs"], list):
+                return {"processed_blobs": [], "last_updated": None}
+            return data
+    except Exception:
+        # If the checkpoint is corrupted, start fresh but do not overwrite yet.
+        return {"processed_blobs": [], "last_updated": None}
+
+
+def save_checkpoint(data: dict, path: Path = CHECKPOINT_FILE) -> None:
+    """Persist checkpoint data atomically."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def add_domain_metadata(
+    chunks: List[Document],
+    source_name: str,
+    domain: str = "family_code",
+    form_category: str | None = None,
+    doc_type: str | None = None,
+):
+    """Add domain, source, and optional doc/category metadata."""
     for chunk in chunks:
         meta = chunk.metadata or {}
         meta.update({"domain": domain, "source": source_name})
+        if form_category:
+            meta.setdefault("form_category", form_category)
+        if doc_type:
+            meta.setdefault("doc_type", doc_type)
         chunk.metadata = meta
         # ensure top-level domain is set for indexing/filtering
         chunk.domain = domain
@@ -314,6 +374,24 @@ def _infer_courtlistener_domain(lower_stem: str) -> str | None:
     return None
 
 
+def infer_court_form_category(name: str) -> str | None:
+    """
+    Infer court form category from the blob name.
+    Examples: child_custody_visitation.txt -> child_custody_visitation
+    """
+    stem = Path(name).name
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    lower_stem = stem.lower()
+
+    if lower_stem in COURT_FORM_CATEGORIES:
+        return lower_stem
+    if lower_stem.startswith("court_forms_"):
+        return lower_stem.replace("court_forms_", "", 1) or None
+    if "court_forms" in lower_stem:
+        return lower_stem.replace("court_forms", "", 1).strip("_-") or lower_stem
+    return lower_stem
+
+
 def infer_domain_from_blob(name: str) -> str:
     """
     Infer domain from the blob name using lowercase prefixes before the first underscore.
@@ -328,6 +406,10 @@ def infer_domain_from_blob(name: str) -> str:
     stem = Path(name).name
     stem = stem.rsplit(".", 1)[0] if "." in stem else stem
     lower_stem = stem.lower()
+
+    # Court forms: keep a single domain and derive category separately
+    if lower_stem in COURT_FORM_CATEGORIES or "court_forms" in lower_stem:
+        return COURT_FORMS_DOMAIN
 
     courtlistener_domain = _infer_courtlistener_domain(lower_stem)
     if courtlistener_domain:
@@ -350,9 +432,21 @@ def infer_domain_from_blob(name: str) -> str:
 
 
 def bytes_to_text(name: str, data: bytes) -> tuple[str, bool]:
-    """Convert blob bytes to text. Only TXT is supported here; PDF path removed."""
+    """Convert blob bytes to text. TXT and JSON supported; PDF path removed."""
     text = data.decode("utf-8", errors="replace")
     return text, False
+
+
+def parse_json_blob(data: bytes) -> tuple[str, dict, str | None]:
+    """
+    Parse JSON blob in IngestibleDocument format.
+    Returns (content, metadata, doc_id) for chunking. doc_id may be None.
+    """
+    raw = json.loads(data.decode("utf-8", errors="replace"))
+    content = raw.get("content", "") or ""
+    metadata = raw.get("metadata", {}) or {}
+    doc_id = raw.get("id")
+    return content, metadata, doc_id
 
 
 def download_blob_to_temp(storage: LegalDocsStorage, blob_name: str, chunk_size: int = 16 * 1024 * 1024) -> str:
@@ -395,28 +489,106 @@ def extract_decision_date(text: str) -> str | None:
     return None
 
 
+def _normalize_date_to_iso(date_str: str | None) -> str | None:
+    """Convert date string to ISO format (YYYY-MM-DD) when possible."""
+    if not date_str or not date_str.strip():
+        return None
+    # Already ISO
+    m = DECISION_DATE_RE_ISO.search(date_str.strip())
+    if m:
+        return m.group(0)
+    # Long form: try to parse and convert
+    m = DECISION_DATE_RE_LONG.search(date_str.strip())
+    if m:
+        try:
+            from datetime import datetime as dt
+            parsed = dt.strptime(m.group(0), "%B %d, %Y")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            try:
+                parsed = dt.strptime(m.group(0), "%b %d, %Y")
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    return date_str.strip()[:10] if len(date_str.strip()) >= 10 else date_str.strip()
+
+
+def _jurisdiction_to_state(jurisdiction: str | None) -> str | None:
+    """Map jurisdiction code to state name."""
+    if not jurisdiction:
+        return None
+    j = jurisdiction.upper()
+    if j == "CA":
+        return "California"
+    if j == "NY":
+        return "new_york"
+    if j == "US":
+        return "United States"
+    return None
+
+
+def infer_state_for_domain(domain: str, jurisdiction: str | None, existing_state: str | None) -> str | None:
+    """Infer state when missing. CA statutes -> California; jurisdiction CA -> California."""
+    if existing_state and existing_state.strip():
+        return existing_state.strip()
+    state = _jurisdiction_to_state(jurisdiction)
+    if state:
+        return state
+    if domain in CA_STATUTE_DOMAINS or domain == COURT_FORMS_DOMAIN:
+        return "California"
+    if domain in COURTLISTENER_DOMAIN_INFO:
+        j = COURTLISTENER_DOMAIN_INFO[domain].get("jurisdiction")
+        return _jurisdiction_to_state(j)
+    return None
+
+
 def main():
     _require(SEARCH_KEY, "AZURE_SEARCH_KEY")
     embedding_endpoint = resolve_embedding_endpoint()
-    
+    checkpoint = load_checkpoint()
+    processed_blobs = set(checkpoint.get("processed_blobs", []))
+
     storage = LegalDocsStorage()
     blobs = storage.list_documents(extensions=SUPPORTED_EXTENSIONS)
 
+    if processed_blobs:
+        print(f"Checkpoint: {len(processed_blobs)} blob(s) already processed.")
+    if not blobs:
+        print("No blobs found.")
+        return
+
+    pending_blobs = [b for b in blobs if b not in processed_blobs]
+    if not pending_blobs:
+        print("All listed blobs already processed according to checkpoint. Nothing to do.")
+        return
+
+    txt_count = sum(1 for b in blobs if b.lower().endswith(".txt"))
+    json_count = sum(1 for b in blobs if b.lower().endswith(".json"))
+    type_info = f"{json_count} JSON, {txt_count} TXT" if json_count and txt_count else (f"{json_count} JSON" if json_count else f"{txt_count} TXT")
     print(
-        f"Found {len(blobs)} document(s) in {storage.raw_container} "
-        f"({len(blobs)} TXT)"
+        f"Found {len(blobs)} document(s) in {storage.raw_container} ({type_info}); pending {len(pending_blobs)} after checkpoint."
     )
 
     search_endpoint = f"https://{SEARCH_SERVICE}.search.windows.net"
     index_client = SearchIndexClient(search_endpoint, AzureKeyCredential(SEARCH_KEY))
     search_client = SearchClient(search_endpoint, INDEX_NAME, AzureKeyCredential(SEARCH_KEY))
 
-    # Ensure index exists (same schema as prepdocs)
-    create_search_index(INDEX_NAME, index_client)
+    # Ensure index exists (same schema as prepdocs) but do not recreate if present
+    index_exists = False
+    try:
+        index_client.get_index(INDEX_NAME)
+        index_exists = True
+        print(f"Index {INDEX_NAME} already exists; reusing.")
+    except HttpResponseError:
+        index_exists = False
+    except Exception as idx_err:
+        print(f"Unexpected error checking index {INDEX_NAME}: {idx_err}. Attempting to create.")
+    if not index_exists:
+        create_search_index(INDEX_NAME, index_client)
 
     total_chunks = 0
     failed_files = 0
-    for name in blobs:
+    for name in pending_blobs:
         print(f"Processing {name} ...")
         success = False
         for attempt in range(10):
@@ -425,19 +597,30 @@ def main():
                 # Stream download to temp file to avoid holding the blob in memory
                 tmp_path = download_blob_to_temp(storage, name)
 
-                with open(tmp_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    # mmap avoids an extra Python-level buffer; decode later in bytes_to_text
-                    text, _ = bytes_to_text(name, mm[:])
+                with open(tmp_path, "rb") as f:
+                    blob_bytes = f.read()
 
-                # Determine domain: LEGAL_DOMAIN takes precedence; otherwise infer from blob name
-                domain_for_blob = LEGAL_DOMAIN or infer_domain_from_blob(name)
+                is_json = name.lower().endswith(".json")
+                json_metadata: dict = {}
+                if is_json:
+                    text, json_metadata, json_doc_id = parse_json_blob(blob_bytes)
+                    domain_for_blob = LEGAL_DOMAIN or (json_metadata.get("domain") or "")
+                    form_category = json_metadata.get("form_category")
+                    doc_type_for_blob = json_metadata.get("doc_type")
+                    file_name_for_chunks = json_doc_id or name
+                else:
+                    text, _ = bytes_to_text(name, blob_bytes)
+                    domain_for_blob = LEGAL_DOMAIN or infer_domain_from_blob(name)
+                    form_category = infer_court_form_category(name) if domain_for_blob == COURT_FORMS_DOMAIN else None
+                    doc_type_for_blob = "court_form" if domain_for_blob == COURT_FORMS_DOMAIN else None
+                    file_name_for_chunks = name
+
                 if not domain_for_blob:
                     raise ValueError(
-                        f"Could not determine domain for blob {name}. Set LEGAL_DOMAIN or use a file name containing the domain."
+                        f"Could not determine domain for blob {name}. Set LEGAL_DOMAIN or use JSON metadata."
                     )
 
                 blocks = split_legal_blocks(text, domain_for_blob)
-                file_name_for_chunks = name
 
                 chunk_idx = 0
                 batch: List[Document] = []
@@ -453,17 +636,27 @@ def main():
                     for sub_block in sub_blocks:
                         result = chunk_content(
                             content=sub_block,
-                            file_name=file_name_for_chunks,
+                            file_name=name,  # use blob path for format detection (.json/.txt)
                             add_embeddings=True,
                             embedding_endpoint=embedding_endpoint,
                             ignore_errors=False,
                             num_tokens=block_tokens if (has_section or has_case) else TOKENS_DEFAULT,
                             min_chunk_size=5,
                         )
-                        add_domain_metadata(result.chunks, source_name=name, domain=domain_for_blob)
+                        add_domain_metadata(
+                            result.chunks,
+                            source_name=name,
+                            domain=domain_for_blob,
+                            form_category=form_category,
+                            doc_type=doc_type_for_blob,
+                        )
 
                         for chunk in result.chunks:
-                            meta = chunk.metadata or {}
+                            meta = dict(chunk.metadata) if chunk.metadata else {}
+                            if is_json and json_metadata:
+                                for k in ("court", "jurisdiction", "case_name", "date_filed", "cluster_id", "state"):
+                                    if json_metadata.get(k):
+                                        meta[k] = json_metadata[k]
                             sec = SECTION_RE.search(sub_block)
                             case = CASE_RE.search(sub_block)
                             citations = set(CITATION_RE.findall(sub_block))
@@ -487,18 +680,38 @@ def main():
                             if court_info:
                                 meta.setdefault("court", court_info["court"])
                                 meta.setdefault("jurisdiction", court_info["jurisdiction"])
+                            if form_category and not meta.get("form_category"):
+                                meta["form_category"] = form_category
                             meta["chunk_index"] = chunk_idx
                             # doc_type heuristics
-                            if domain_for_blob in {"family_code", "code_of_civil_procedure", "civil_code", "evidence_code"}:
+                            if doc_type_for_blob:
+                                meta.setdefault("doc_type", doc_type_for_blob)
+                            elif domain_for_blob in {"family_code", "code_of_civil_procedure", "civil_code", "evidence_code"}:
                                 meta["doc_type"] = "statute"
                             elif domain_for_blob == "rules_of_court":
                                 meta["doc_type"] = "rule"
                             else:
                                 meta["doc_type"] = "case"
 
+                            # Standardize date_filed: prefer date_filed from JSON, fallback to decision_date from text
+                            date_val = meta.get("date_filed") or meta.get("decision_date")
+                            meta["date_filed"] = _normalize_date_to_iso(date_val)
+                            meta["state"] = infer_state_for_domain(
+                                domain_for_blob, meta.get("jurisdiction"), meta.get("state")
+                            )
+
                             # stable, search-safe id per chunk to avoid overwrites and invalid keys
                             chunk.id = make_chunk_id(name, chunk_idx)
                             chunk.metadata = json.dumps(meta)
+
+                            # Top-level fields for filtering and display in Azure AI Search
+                            chunk.filepath = name
+                            chunk.source = name
+                            chunk.court = meta.get("court")
+                            chunk.jurisdiction = meta.get("jurisdiction")
+                            chunk.state = meta.get("state")
+                            chunk.date_filed = meta.get("date_filed")
+                            chunk.doc_type = meta.get("doc_type")
                             chunk_idx += 1
 
                         batch.extend(result.chunks)
@@ -507,7 +720,7 @@ def main():
                         if len(batch) >= UPLOAD_BATCH_SIZE:
                             est_bytes = estimate_batch_bytes(batch)
                             print(f"Uploading batch of {len(batch)} chunk(s) for {name} to index {INDEX_NAME} (~{est_bytes / (1024 * 1024):.2f} MB) ...")
-                            upload_documents_to_index(batch, search_client)
+                            upload_documents_to_index(batch, search_client, upload_batch_size=UPLOAD_BATCH_SIZE)
                             total_chunks += len(batch)
                             batch.clear()
 
@@ -517,7 +730,7 @@ def main():
                 if batch:
                     est_bytes = estimate_batch_bytes(batch)
                     print(f"Uploading final batch of {len(batch)} chunk(s) for {name} to index {INDEX_NAME} (~{est_bytes / (1024 * 1024):.2f} MB) ...")
-                    upload_documents_to_index(batch, search_client)
+                    upload_documents_to_index(batch, search_client, upload_batch_size=UPLOAD_BATCH_SIZE)
                     total_chunks += len(batch)
                     batch.clear()
 
@@ -529,7 +742,11 @@ def main():
                 success = True
                 break
             except Exception as file_err:
-                print(f"Error processing {name} (attempt {attempt + 1}/3): {file_err}")
+                print(f"Error processing {name} (attempt {attempt + 1}/10): {file_err}")
+                if attempt < 9:
+                    backoff_sec = min(60, 2**attempt)
+                    print(f"Retrying in {backoff_sec}s ...")
+                    time.sleep(backoff_sec)
             finally:
                 if tmp_path:
                     try:
@@ -538,6 +755,11 @@ def main():
                         pass
         if not success:
             failed_files += 1
+        else:
+            processed_blobs.add(name)
+            checkpoint["processed_blobs"] = sorted(processed_blobs)
+            checkpoint["last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
+            save_checkpoint(checkpoint)
 
     if total_chunks == 0:
         print("No chunks to index. Exiting.")
@@ -545,6 +767,30 @@ def main():
         print(f"Done. Uploaded {total_chunks} chunk(s) across {len(blobs) - failed_files} file(s). Failed files: {failed_files}.")
 
 
+def run_reset():
+    """Delete the search index and clear checkpoint so index_from_blob can re-index from scratch with new dimensions."""
+    _require(SEARCH_KEY, "AZURE_SEARCH_KEY")
+    search_endpoint = f"https://{SEARCH_SERVICE}.search.windows.net"
+    index_client = SearchIndexClient(search_endpoint, AzureKeyCredential(SEARCH_KEY))
+    try:
+        index_client.delete_index(INDEX_NAME)
+        print(f"Deleted index {INDEX_NAME}.")
+    except HttpResponseError as e:
+        if e.status_code == 404:
+            print(f"Index {INDEX_NAME} did not exist; nothing to delete.")
+        else:
+            raise
+    save_checkpoint({"processed_blobs": [], "last_updated": None})
+    print(f"Checkpoint cleared. Ready to run: python scripts/index_from_blob.py")
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Index TXT/JSON from Azure Blob into Azure AI Search.")
+    parser.add_argument("--reset", action="store_true", help="Delete index and clear checkpoint; then run index_from_blob to re-index with VECTOR_DIMENSION=3072")
+    args = parser.parse_args()
+    if args.reset:
+        run_reset()
+    else:
+        main()
 

@@ -1,5 +1,5 @@
 """
-Joogni - California Family Law AI Assistant
+Joogni - Multi-jurisdiction Legal AI Assistant
 Main Application with Dashboard, Chat, Calculators, and M365 Integration
 Now with Function Calling for Emails, Calendar, and OneDrive
 """
@@ -11,11 +11,15 @@ import math
 import json
 import base64
 import re
+import hashlib
 import httpx
 import uuid
 import time
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from openai import AzureOpenAI
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -40,7 +44,7 @@ from backend.storage.blob_storage import LegalDocsStorage
 from dotenv import load_dotenv
 load_dotenv(override=False)
 
-app = FastAPI(title="Joogni", description="California Family Law AI Assistant")
+app = FastAPI(title="Joogni", description="Multi-jurisdiction Legal AI Assistant")
 
 # Mount static files only if directory exists
 static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -57,8 +61,24 @@ elif os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tem
     templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 templates = Jinja2Templates(directory=templates_dir)
 
-# System prompt for Joogni
-JOOGNI_SYSTEM_PROMPT = """You are Joogni, a California family law AI assistant designed for attorneys at Gill Law Group. 
+# ============== Multi-Jurisdiction Registry ==============
+# Display name (from dropdown) -> internal jurisdiction id
+JURISDICTION_NAME_TO_ID = {
+    "California": "ca",
+    "New York": "ny",
+    "Texas": "tx",
+    "Florida": "fl",
+    "Illinois": "il",
+    "Arizona": "az",
+    "Nevada": "nv",
+    "Washington": "wa",
+    "Oregon": "or",
+    "Colorado": "co",
+}
+
+# System prompts per jurisdiction. Only CA is fully implemented.
+JURISDICTION_SYSTEM_PROMPT = {
+    "ca": """You are Joogni, a California family law AI assistant designed for attorneys at Gill Law Group. 
 
 Your expertise includes:
 - California Family Code
@@ -82,8 +102,9 @@ When answering legal questions:
 3. Provide practical, actionable guidance
 4. Note any recent changes in law or procedure
 5. Flag issues that may require judicial discretion
-6. Use the context provided to answer the question. If the context is not sufficient, respond politely: 'I don't have enough information to answer that. Please reformulate with more specifics related to California family law (including, but not limited to, custody modification, evidence code exclusion, domestic violence findings, child support calculations), and I'll try again. I will not invent information.'
-7. The information in the context is the only information you can use to answer the legal question. Do not use any other information or sources.
+6. ALWAYS reuse prior conversation content, attachments already processed, and documents from the index. NEVER say 'I don't have enough information' when you have: prior generated content, attachment content, or index context.
+7. When the user asks to expand, add arguments, summarize, or revise: expand based on the existing document and context. Consider sections such as: best interests of the child, balance of hardships, credibility analysis, burden of proof, statutory interpretation, public policy, case law analogies.
+8. Use only the context provided for legal assertions. Do not invent statutes or cases not in the context.
 
 
 For document analysis:
@@ -98,7 +119,47 @@ For email/calendar context:
 
 Always maintain attorney-client privilege awareness and remind users not to share client-identifying information outside secure channels.
 
-Format responses with clear structure when appropriate. Be thorough but concise."""
+Format responses with clear structure when appropriate. Be thorough but concise.""",
+    "ny": None,
+    "tx": None,
+    "fl": None,
+    "il": None,
+    "az": None,
+    "nv": None,
+    "wa": None,
+    "or": None,
+    "co": None,
+}
+
+# Config per jurisdiction: implemented, domains for legal search, M365 tools enabled
+JURISDICTION_CONFIG = {
+    "ca": {
+        "implemented": True,
+        "display_name": "California",
+        "domains": ["family_code", "evidence_code"],
+        "has_tools": True,
+    },
+    "ny": {"implemented": False, "display_name": "New York", "domains": [], "has_tools": False},
+    "tx": {"implemented": False, "display_name": "Texas", "domains": [], "has_tools": False},
+    "fl": {"implemented": False, "display_name": "Florida", "domains": [], "has_tools": False},
+    "il": {"implemented": False, "display_name": "Illinois", "domains": [], "has_tools": False},
+    "az": {"implemented": False, "display_name": "Arizona", "domains": [], "has_tools": False},
+    "nv": {"implemented": False, "display_name": "Nevada", "domains": [], "has_tools": False},
+    "wa": {"implemented": False, "display_name": "Washington", "domains": [], "has_tools": False},
+    "or": {"implemented": False, "display_name": "Oregon", "domains": [], "has_tools": False},
+    "co": {"implemented": False, "display_name": "Colorado", "domains": [], "has_tools": False},
+}
+
+
+def resolve_jurisdiction(payload_value: str) -> tuple:
+    """
+    Returns (jurisdiction_id, config).
+    If not implemented: config["implemented"] == False.
+    """
+    jid = JURISDICTION_NAME_TO_ID.get(payload_value) or JURISDICTION_NAME_TO_ID.get("California", "ca")
+    config = JURISDICTION_CONFIG.get(jid, {"implemented": False, "domains": [], "has_tools": False})
+    return jid, config
+
 
 # Multi-domain legal search config (single index with domain field)
 LEGAL_DOMAINS = [
@@ -115,6 +176,7 @@ MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "20"))
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-3-large; must match Azure Search index contentVector
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
 PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "200"))
 PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
@@ -128,24 +190,52 @@ def run_multi_domain_search(
     domains: List[str],
     max_domains: int,
     top_per_domain: int,
+    embed_client: Optional["AzureOpenAI"] = None,
 ):
     """
-    Controlled multi-domain search: applies filter "domain eq '<domain>'" for each candidate.
-    If there are no hits in any, performs a search without filter as a fallback.
+    Hybrid (vector + keyword) or keyword-only multi-domain search.
+    If embed_client is provided and EMBEDDING_DEPLOYMENT is set, uses hybrid search.
     Returns (context_chunks, domains_with_hits).
     """
+    from azure.search.documents.models import VectorizedQuery
+
     context_chunks = []
     domains_with_hits = []
-
     candidates = [d.strip() for d in domains if d.strip()][:max_domains]
+
+    # Hybrid: embed query for vector search
+    query_vector = None
+    if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
+        try:
+            emb = embed_client.embeddings.create(
+                model=EMBEDDING_DEPLOYMENT,
+                input=[query.strip()[:8000]],
+                dimensions=VECTOR_DIMENSION,
+            )
+            query_vector = emb.data[0].embedding
+        except Exception as e:
+            print(f"Embedding error (fallback to keyword only): {e}", file=sys.stderr)
+
+    def _do_search(dom_filter: Optional[str] = None):
+        kwargs = {
+            "search_text": query,
+            "top": top_per_domain,
+        }
+        if dom_filter:
+            kwargs["filter"] = f"domain eq '{dom_filter}'"
+        if query_vector:
+            kwargs["vector_queries"] = [
+                VectorizedQuery(
+                    vector=query_vector,
+                    k_nearest_neighbors=top_per_domain,
+                    fields="contentVector",
+                )
+            ]
+        return search_client.search(**kwargs)
 
     for dom in candidates:
         try:
-            results = search_client.search(
-                search_text=query,
-                top=top_per_domain,
-                filter=f"domain eq '{dom}'",
-            )
+            results = _do_search(dom_filter=dom)
             hit_count = 0
             for r in results:
                 content = (r.get("content") or "").strip()
@@ -160,13 +250,11 @@ def run_multi_domain_search(
             if hit_count > 0:
                 domains_with_hits.append(dom)
         except Exception as e:
-            # log and continue with other domains
             print(f"Search error for domain {dom}: {e}", file=sys.stderr)
 
-    # Fallback without filter if nothing found
     if not context_chunks:
         try:
-            results = search_client.search(search_text=query, top=top_per_domain)
+            results = _do_search(dom_filter=None)
             for r in results:
                 content = (r.get("content") or "").strip()
                 meta = (r.get("metadata") or "").strip()
@@ -278,6 +366,13 @@ TOOLS = [
         }
     }
 ]
+
+
+def get_tools(jurisdiction_id: str, config: dict, graph_token_available: bool) -> Optional[List]:
+    """Returns tools for jurisdiction. Only CA has functional tools at the moment."""
+    if not config.get("implemented") or not config.get("has_tools"):
+        return None
+    return TOOLS if graph_token_available else None
 
 
 def get_user_info(request: Request) -> dict:
@@ -473,10 +568,31 @@ def _generate_sas_url(blob_service: BlobServiceClient, container: str, blob_name
     return upload_url, blob_name
 
 
-def _safe_blob_name(filename: str) -> str:
+def _get_user_blob_prefix(request: Request) -> str:
+    """Return a stable prefix for the current user's blobs (isolation by user)."""
+    user_info = get_user_info(request)
+    uid = ""
+    if user_info:
+        uid = (
+            user_info.get("userId")
+            or user_info.get("user_id")
+            or user_info.get("email")
+            or ""
+        )
+        if not uid and isinstance(user_info.get("userDetails"), str):
+            uid = user_info["userDetails"]
+    raw = (uid or "anonymous").strip().lower()
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"u_{h}"
+
+
+def _safe_blob_name(filename: str, user_prefix: str = "") -> str:
     base = os.path.basename(filename)
     base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
-    return f"{uuid.uuid4()}-{base}"
+    name = f"{uuid.uuid4()}-{base}"
+    if user_prefix:
+        return f"{user_prefix}/{name}"
+    return name
 
 
 def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
@@ -603,6 +719,7 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         raise HTTPException(status_code=400, detail=f"Too many files. Max {MAX_ATTACHMENT_FILES}.")
 
     storage = LegalDocsStorage()
+    upload_container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
     attachment_sections: List[str] = []
     top_chunks_per_file = 3
 
@@ -612,7 +729,8 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
     print("EMBED INPUT PREVIEW:", repr(safe_query)[:500], file=sys.stderr)
     query_embed_resp = client.embeddings.create(
         model=EMBEDDING_DEPLOYMENT,
-        input=[safe_query]
+        input=[safe_query],
+        dimensions=VECTOR_DIMENSION,
     )
     query_vec = query_embed_resp.data[0].embedding
 
@@ -624,21 +742,20 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         file_bytes = b""
         chunk_texts: List[str] = []
         try:
-            file_bytes = storage.download_file(blob_name)
+            file_bytes = storage.download_file(blob_name, container=upload_container)
             if len(file_bytes) > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {MAX_UPLOAD_SIZE_MB}MB limit.")
 
             if original_filename.lower().endswith(".pdf"):
                 text = _extract_text_from_pdf(file_bytes, original_filename)
-            elif original_filename.lower().endswith(".txt"):
-                text = file_bytes.decode("utf-8", errors="ignore")
             else:
-                raise HTTPException(status_code=400, detail=f"Unsupported file type for {original_filename}. Use PDF or TXT.")
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {original_filename}. Only PDF is allowed.")
 
             chunk_texts = _chunk_text(text)
-        finally:
-            # Delete the blob regardless of processing outcome (best-effort)
-            storage.delete_file(blob_name)
+        except Exception:
+            raise
+        # Do not delete blob here: follow-up messages in the same conversation
+        # need to re-download the attachment; blobs persist until explicitly cleaned.
 
         if not chunk_texts:
             continue
@@ -646,7 +763,8 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         # Embed chunks for this file
         embed_resp = client.embeddings.create(
             model=EMBEDDING_DEPLOYMENT,
-            input=[str(c) for c in chunk_texts]
+            input=[str(c) for c in chunk_texts],
+            dimensions=VECTOR_DIMENSION,
         )
         scored: List[Tuple[float, str]] = []
         for chunk_text, emb in zip(chunk_texts, embed_resp.data):
@@ -1021,6 +1139,23 @@ async def box_status(request: Request):
         "message": "Box integration not configured"
     })
 
+def pick_search_query(messages: List[dict]) -> str:
+    """
+    Uses the first user question as the search query (the most substantive one).
+    For follow-ups like 'add more arguments' or 'make a summary', search uses the original question.
+    Fallback: last user message if none is substantive.
+    """
+    first_substantive = ""
+    last_user = ""
+    for msg in messages:
+        if msg.get("role") == "user":
+            text = normalize_to_text(msg.get("content", ""))
+            last_user = text
+            if len(text.strip()) > 10 and not first_substantive:
+                first_substantive = text
+    return first_substantive or last_user
+
+
 def normalize_to_text(x) -> str:
     if x is None:
         return ""
@@ -1064,11 +1199,12 @@ async def get_upload_url(request: Request):
         if not filename:
             raise HTTPException(status_code=400, detail="filename is required")
 
-        container = os.getenv("UPLOAD_CONTAINER", "legal-docs-raw")
+        container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
         blob_service = _get_blob_service_client()
         _ensure_container(blob_service, container)
 
-        blob_name = _safe_blob_name(filename)
+        user_prefix = _get_user_blob_prefix(request)
+        blob_name = _safe_blob_name(filename, user_prefix=user_prefix)
         upload_url, final_blob_name = _generate_sas_url(blob_service, container, blob_name)
 
         return JSONResponse({
@@ -1076,6 +1212,51 @@ async def get_upload_url(request: Request):
             "blob_name": final_blob_name,
             "max_size_mb": MAX_UPLOAD_SIZE_MB
         })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _user_owns_blob(request: Request, blob_name: str) -> bool:
+    """Verify blob belongs to the current user (must have user prefix)."""
+    if not blob_name or not isinstance(blob_name, str):
+        return False
+    prefix = _get_user_blob_prefix(request)
+    # Blob must start with "u_xxxx/" to be user-scoped
+    return blob_name.startswith(prefix + "/")
+
+
+@app.post("/api/delete-attachment")
+async def delete_attachment(request: Request):
+    """Delete blob(s) from storage when user removes PDF or page reloads.
+    Only deletes blobs that belong to the current user (user-prefixed paths).
+    """
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        blob_name = data.get("blob_name")
+        blob_names = data.get("blob_names") or []
+
+        if blob_name:
+            blob_names = [blob_name]
+
+        if not blob_names:
+            return JSONResponse({"deleted": 0, "message": "No blobs to delete"})
+
+        storage = LegalDocsStorage()
+        deleted = 0
+        for name in blob_names:
+            if name and isinstance(name, str) and _user_owns_blob(request, name):
+                if storage.delete_file(name):
+                    deleted += 1
+
+        return JSONResponse({"deleted": deleted, "blob_names": blob_names})
     except HTTPException:
         raise
     except Exception as e:
@@ -1092,6 +1273,19 @@ async def conversation(request: Request):
         data = await request.json()
         print(f"Full request data: {data}", file=sys.stderr)
         print(f"Data keys: {data.keys() if isinstance(data, dict) else 'not a dict'}", file=sys.stderr)
+        
+        # Resolve jurisdiction; early return if not implemented
+        jurisdiction_raw = data.get("jurisdiction", "California")
+        jid, j_config = resolve_jurisdiction(jurisdiction_raw)
+        display_name = j_config.get("display_name", jurisdiction_raw)
+        if not j_config.get("implemented"):
+            print(f"Jurisdiction {jid} ({display_name}) not implemented, returning controlled message", file=sys.stderr)
+            return JSONResponse({
+                "job_id": str(uuid.uuid4()),
+                "status": "completed",
+                "response": f"This state ({display_name}) is not yet supported. Only California is currently available.",
+                "error": "STATE_NOT_SUPPORTED"
+            }, status_code=200)
         
         # Try different possible message formats
         messages = data.get("messages", [])
@@ -1120,6 +1314,7 @@ async def conversation(request: Request):
         search_key = os.getenv("AZURE_SEARCH_KEY")
         # Normalize: SDK needs base endpoint (no path). Version: prefer EMBEDDING, then API, then query, then default.
         endpoint = raw_endpoint
+        # 2023-05-15 ignores dimensions param for text-embedding-3-large, returns 3072; 2024-02-01+ requires it
         version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
         
         print(f"Endpoint: {endpoint}", file=sys.stderr)
@@ -1148,45 +1343,42 @@ async def conversation(request: Request):
         )
         print("Client created, making request...", file=sys.stderr)
         
-        # Build messages with system prompt
-        chat_messages = [{"role": "system", "content": JOOGNI_SYSTEM_PROMPT}]
-        
-        last_user = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                last_user = msg.get("content", "")
-                break
+        # Build messages with jurisdiction-specific system prompt
+        system_prompt = JURISDICTION_SYSTEM_PROMPT.get(jid) or ""
+        chat_messages = [{"role": "system", "content": system_prompt}]
+
+        search_query = pick_search_query(messages)
+        has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
 
         legal_mode = False
         context_chunks = []
         no_context = False
         attachment_contexts: List[str] = []
-        if search_service and search_index and search_key and last_user:
+        if search_service and search_index and search_key and search_query:
             try:
                 search_endpoint = f"https://{search_service}.search.windows.net"
                 search_client = SearchClient(
                     search_endpoint, search_index, AzureKeyCredential(search_key)
                 )
 
-                # Candidate domains: from payload ("domains") or ENV (LEGAL_DOMAINS)
                 request_domains = data.get("domains", [])
                 if isinstance(request_domains, str):
                     request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
                 elif not isinstance(request_domains, list):
                     request_domains = []
 
-                candidates = request_domains or LEGAL_DOMAINS
+                candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
                 candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
+                search_query = normalize_to_text(search_query)
 
-                last_user = normalize_to_text(last_user)
-
-                print(f"Running multi-domain search for query='{last_user}' domains={candidates}", file=sys.stderr)
+                print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
                 context_chunks, domains_with_hits = run_multi_domain_search(
                     search_client=search_client,
-                    query=last_user,
+                    query=search_query,
                     domains=candidates,
                     max_domains=LEGAL_MAX_DOMAINS,
                     top_per_domain=LEGAL_TOP_PER_DOMAIN,
+                    embed_client=client,
                 )
 
                 legal_mode = len(context_chunks) > 0
@@ -1196,26 +1388,32 @@ async def conversation(request: Request):
                     chat_messages.append({
                         "role": "user",
                         "content": (
-                            "Use only the context below (tagged por DOMAIN). "
-                            "Cite the sources. If context is insufficient, reply exactly: "
-                            "'I don't have enough information to answer that question.'\n"
+                            "Use the context below (tagged by DOMAIN). Cite the sources. "
+                            "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
                             + ctx
                         )
                     })
                     print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
                 else:
                     no_context = True
-                    print("Legal RAG skipped (no relevant search hits); instructing model to say no context", file=sys.stderr)
+                    print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
             except Exception as search_err:
                 print(f"Legal RAG search error: {search_err}", file=sys.stderr)
         else:
             print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
 
-        # Attachments uploaded by user (PDF/TXT) for this request
+        # Attachments uploaded by user (PDF only)
         blobs = data.get("blobs", [])
+        for b in blobs:
+            fn = (b.get("original_filename") or b.get("blob_name") or "").lower()
+            if not fn.endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file type. Only PDF is allowed.",
+                )
         if blobs:
             try:
-                attachment_contexts = await _build_attachment_context(blobs, last_user, client)
+                attachment_contexts = await _build_attachment_context(blobs, search_query or "legal", client)
             except HTTPException:
                 raise
             except Exception as attach_err:
@@ -1223,7 +1421,6 @@ async def conversation(request: Request):
                 raise HTTPException(status_code=500, detail=f"Attachment processing failed: {attach_err}")
 
         if attachment_contexts:
-            # We have user-provided context; do not force the model to say "no context"
             no_context = False
             chat_messages.append({
                 "role": "user",
@@ -1234,12 +1431,18 @@ async def conversation(request: Request):
                     + "\n\n".join(attachment_contexts)
                 )
             })
-        
-        # If no relevant context, instruct the model not to invent
+
+        if has_prior_context:
+            no_context = False
+
         if no_context:
             chat_messages.append({
                 "role": "user",
-                "content": "There is no relevant context in the index for this legal question. Respond with 'I don't have enough information to answer that legal question. do not invent information.'. Do not use any other information or sources."
+                "content": (
+                    "No relevant matches were found in the legal index for this specific query. "
+                    "You may answer based on prior conversation context, attachments, or indicate that no matching statutes/cases were found. "
+                    "Never refuse with 'I don't have enough information' if you have context from the conversation or attachments."
+                )
             })
 
         # Add context if provided
@@ -1261,17 +1464,18 @@ async def conversation(request: Request):
             })
         
         print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
-        # lower temperature for legal questions to reduce creativity
-        temperature = 0.2 if legal_mode else 0.7
-        print(f"Making Azure OpenAI call with tools={bool(graph_token)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
+        # Temperature: 0.2 for laws/citations; 0.5 for argumentation/expansion
+        temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
+        tools_for_request = get_tools(jid, j_config, bool(graph_token))
+        print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
         
         # First call - may request tool use
         try:
             response = client.chat.completions.create(
                 model=deployment,
                 messages=chat_messages,
-                tools=TOOLS if graph_token else None,
-                tool_choice="auto" if graph_token else None,
+                tools=tools_for_request,
+                tool_choice="auto" if tools_for_request else None,
                 temperature=temperature,
                 max_tokens=2000
             )

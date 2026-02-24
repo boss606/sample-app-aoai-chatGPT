@@ -3,6 +3,9 @@ Azure Blob Storage client for legal documents
 Supports both Managed Identity (production) and Connection String (development)
 """
 
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
+
 from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
 from azure.core.exceptions import ResourceNotFoundError
@@ -13,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
-if os.getenv("ENVIRONMENT", "dev") == "prod":
-    load_dotenv(override=True)
+# Always load .env for local development (connection string, etc.)
+load_dotenv(override=False)
+
 
 class LegalDocsStorage:
     """Manages legal documents (PDF/TXT) in Azure Blob Storage"""
@@ -102,12 +106,14 @@ class LegalDocsStorage:
             logger.error(f"❌ Failed to upload text {blob_name}: {str(e)}")
             return False
     
-    def download_file(self, blob_name: str) -> bytes:
+    def download_file(self, blob_name: str, container: Optional[str] = None) -> bytes:
         """
         Download file (PDF/TXT) from Blob Storage
         
         Args:
             blob_name: Name of blob to download
+            container: Container name (defaults to raw_container).
+                       Use same as UPLOAD_CONTAINER for chat attachments.
             
         Returns:
             File content as bytes
@@ -115,9 +121,10 @@ class LegalDocsStorage:
         Raises:
             ResourceNotFoundError: If blob doesn't exist
         """
+        c = container or self.raw_container
         try:
             blob_client = self.blob_service.get_blob_client(
-                container=self.raw_container,
+                container=c,
                 blob=blob_name
             )
             
@@ -161,6 +168,61 @@ class LegalDocsStorage:
             logger.error(f"❌ Failed to delete {blob_name}: {str(e)}")
             return False
     
+    def list_blobs_by_prefix(self, prefix: str, extensions: tuple = ('.json',)) -> list:
+        """
+        List blobs under a given prefix (e.g., california/courtlistener/).
+
+        Args:
+            prefix: Blob name prefix (e.g., "california/courtlistener").
+            extensions: tuple of extensions to include (default: .json).
+
+        Returns:
+            List of blob names matching the prefix and extensions.
+        """
+        try:
+            container_client = self.blob_service.get_container_client(self.raw_container)
+            blobs = [
+                blob.name
+                for blob in container_client.list_blobs(name_starts_with=prefix)
+                if blob.name.lower().endswith(tuple(ext.lower() for ext in extensions))
+            ]
+            logger.info(f"✅ Found {len(blobs)} blobs under {prefix} ({extensions})")
+            return blobs
+        except Exception as e:
+            logger.error(f"❌ Failed to list blobs by prefix {prefix}: {str(e)}")
+            return []
+
+    def list_blobs_with_timestamps(
+        self,
+        prefix: str,
+        extensions: tuple = ('.pdf', '.txt', '.json'),
+    ) -> List[Tuple[str, datetime]]:
+        """
+        List blobs under a prefix with their last_modified timestamps.
+
+        Args:
+            prefix: Blob name prefix (e.g. "u_" for user uploads).
+            extensions: Tuple of extensions to include.
+
+        Returns:
+            List of (blob_name, last_modified) tuples.
+        """
+        try:
+            container_client = self.blob_service.get_container_client(self.raw_container)
+            result = []
+            for blob in container_client.list_blobs(name_starts_with=prefix):
+                if blob.name.lower().endswith(tuple(ext.lower() for ext in extensions)):
+                    # last_modified can be None for some blob types; default to epoch
+                    lm = blob.last_modified or datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    if lm.tzinfo is None:
+                        lm = lm.replace(tzinfo=timezone.utc)
+                    result.append((blob.name, lm))
+            logger.info(f"✅ Found {len(result)} blobs under {prefix}")
+            return result
+        except Exception as e:
+            logger.error(f"❌ Failed to list blobs with timestamps: {str(e)}")
+            return []
+
     def list_documents(self, extensions: tuple = ('.pdf', '.txt')) -> list:
         """
         List documents in the raw container by extension

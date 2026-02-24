@@ -12,6 +12,28 @@ This repo contains sample code for a simple chat webapp that integrates with Azu
   - Azure SQL Server (private preview)
   - Mongo DB (preview)
 
+## PDF uploads and OCR
+- When a PDF has no embedded text (scans/redactions), the backend now falls back to OCR (Tesseract + pdf2image). If OCR is disabled or fails, the API returns 400 with a clear message instead of 500.
+- System packages required for OCR: `tesseract-ocr` and `poppler-utils` (or equivalent for your distro). Install them in your container/host.
+- Python deps: `pdf2image`, `pytesseract`, `Pillow`.
+- Env toggles:
+  - `PDF_OCR_ENABLED` (default `true`)
+  - `PDF_OCR_MAX_PAGES` (default `20`) to bound runtime
+  - `PDF_OCR_DPI` (default `200`) and `PDF_OCR_LANG` (default `eng`)
+- Large scans: if page count exceeds `PDF_OCR_MAX_PAGES`, upload a smaller excerpt or a version that already has OCR text.
+
+### Data ingestion
+- Legal data (codes, court forms, CourtListener opinions) is ingested via `scripts/data_ingestion/`. Run the appropriate `run_*.py` in each module.
+- Legacy API-based CourtListener scrapers were removed; see [docs/SCRAPERS_LEGACY.md](docs/SCRAPERS_LEGACY.md) for the previous URLs and approach.
+
+### Old attachments cleanup
+- The script `scripts/cleanup_old_attachments.py` removes **only** blobs uploaded from the frontend (PDFs with prefix `u_*`) older than 24 hours. Does not alter blobs from data_ingestion or other sources.
+- Variables: `CLEANUP_MAX_AGE_HOURS` (default 24), `CLEANUP_DRY_RUN=1` to simulate.
+- Run daily via cron, e.g. at 03:00:
+  ```bash
+  0 3 * * * cd /path/to/project && python scripts/cleanup_old_attachments.py >> /var/log/cleanup_attachments.log 2>&1
+  ```
+
 ## Configure the app
 
 ### Create a .env file for local development

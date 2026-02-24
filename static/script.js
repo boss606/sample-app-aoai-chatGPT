@@ -2,6 +2,8 @@
 var attachedFiles = [];
 var selectedEmails = [];
 var selectedCalendarEvents = [];
+// Conversation history for backend continuity (reuse context across turns)
+var messageHistory = [];
 var searchSource = 'email';
 var selectedM365Items = [];
 var boxConnected = false;
@@ -104,6 +106,19 @@ document.addEventListener('DOMContentLoaded', function() {
     checkBoxStatus();
     loadUserInfo();
 });
+
+// Delete uploaded blobs from storage when page unloads/reloads
+function cleanupAttachedBlobsOnUnload() {
+    if (attachedFiles.length > 0) {
+        var blobNames = attachedFiles.map(function(f) { return f.blob_name; }).filter(Boolean);
+        if (blobNames.length > 0 && navigator.sendBeacon) {
+            var blob = new Blob([JSON.stringify({ blob_names: blobNames })], { type: 'application/json' });
+            navigator.sendBeacon('/api/delete-attachment', blob);
+        }
+    }
+}
+window.addEventListener('beforeunload', cleanupAttachedBlobsOnUnload);
+window.addEventListener('pagehide', cleanupAttachedBlobsOnUnload);
 
 // --- USER INFO ---
 
@@ -877,9 +892,14 @@ async function addSelectedToChat() {
         });
     }
     
-    // Download OneDrive/email attachment files
+    // Download OneDrive/email attachment files (apenas PDF)
     for (var m = 0; m < files.length; m++) {
         var item = files[m];
+        var ext = (item.name || '').split('.').pop().toLowerCase();
+        if (ext !== 'pdf') {
+            addMessage('Arquivo "' + (item.name || '') + '" recusado. Apenas PDF é permitido.', 'system-error');
+            continue;
+        }
         try {
             if (item.type === 'email-attachment') {
                 var response = await fetch('/api/get-upload-url', {
@@ -938,9 +958,14 @@ async function addSelectedToChat() {
         }
     }
     
-    // Download Box files
+    // Download Box files (apenas PDF)
     for (var b = 0; b < boxFiles.length; b++) {
         var boxFile = boxFiles[b];
+        var boxExt = (boxFile.name || '').split('.').pop().toLowerCase();
+        if (boxExt !== 'pdf') {
+            addMessage('Arquivo "' + (boxFile.name || '') + '" recusado. Apenas PDF é permitido.', 'system-error');
+            continue;
+        }
         try {
             var boxResponse = await fetch('/api/box/download', {
                 method: 'POST',
@@ -989,6 +1014,11 @@ async function handleFileSelect(event) {
 
     for (var i = 0; i < files.length; i++) {
         var file = files[i];
+        var ext = (file.name || '').split('.').pop().toLowerCase();
+        if (ext !== 'pdf') {
+            addMessage('Arquivo "' + file.name + '" recusado. Apenas PDF é permitido.', 'system-error');
+            continue;
+        }
         if (file.size > 50 * 1024 * 1024) {
             addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
             continue;
@@ -1108,7 +1138,20 @@ function getFileIconClass(filename) {
     return getFileIcon(filename);
 }
 
-function removeAttachment(index) {
+async function removeAttachment(index) {
+    var file = attachedFiles[index];
+    if (file && file.blob_name) {
+        try {
+            await fetch('/api/delete-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ blob_name: file.blob_name }),
+                credentials: 'same-origin'
+            });
+        } catch (e) {
+            console.warn('Failed to delete blob on server:', e);
+        }
+    }
     attachedFiles.splice(index, 1);
     updateAttachmentsUI();
 }
@@ -1123,11 +1166,32 @@ function removeCalendarEvent(index) {
     updateAttachmentsUI();
 }
 
-function clearAllAttachments() {
+async function clearAllAttachments() {
+    // Delete blobs from storage before clearing
+    if (attachedFiles.length > 0) {
+        var blobNames = attachedFiles.map(function(f) { return f.blob_name; }).filter(Boolean);
+        if (blobNames.length > 0) {
+            try {
+                await fetch('/api/delete-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_names: blobNames }),
+                    credentials: 'same-origin'
+                });
+            } catch (e) {
+                console.warn('Failed to delete blobs on clear:', e);
+            }
+        }
+    }
     attachedFiles = [];
     selectedEmails = [];
     selectedCalendarEvents = [];
     updateAttachmentsUI();
+}
+
+function startNewConversation() {
+    messageHistory = [];
+    clearAllAttachments();
 }
 
 // --- CHAT FUNCTIONS ---
@@ -1156,6 +1220,10 @@ async function sendMessage() {
     addMessage(displayMessage, 'user');
     input.value = '';
 
+    // Add user message to history (raw content for backend)
+    var userContent = message || 'Please analyze the attached content.';
+    messageHistory.push({ role: 'user', content: userContent });
+
     // Get jurisdiction
     var jurisdictionSelect = document.getElementById('jurisdiction');
     var jurisdiction = jurisdictionSelect ? jurisdictionSelect.value : 'California';
@@ -1168,8 +1236,9 @@ async function sendMessage() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
-                query: message || 'Please analyze the attached content.',
+                query: userContent,
                 jurisdiction: jurisdiction,
+                messages: messageHistory,
                 blobs: attachedFiles,
                 emails: selectedEmails,
                 calendar_events: selectedCalendarEvents
@@ -1181,6 +1250,7 @@ async function sendMessage() {
         if (data.error) {
             removeMessage(statusId);
             addMessage('Error: ' + data.error, 'system-error');
+            messageHistory.pop();
             return;
         }
 
@@ -1191,17 +1261,21 @@ async function sendMessage() {
 
         if (result.status === 'completed') {
             addMessage(data.response, 'system', true);
+            messageHistory.push({ role: 'assistant', content: data.response || '' });
         } else if (result.status === 'Failed') {
             addMessage('Error: ' + result.result, 'system-error');
+            messageHistory.pop();
         } else {
             addMessage('Request timed out. Please try again.', 'system-error');
+            messageHistory.pop();
         }
 
-        clearAllAttachments();
+        // Do NOT clear attachments - keep for conversational continuity
 
     } catch (error) {
         removeMessage(statusId);
         addMessage('Failed to connect to server: ' + error.message, 'system-error');
+        messageHistory.pop();
     }
 }
 

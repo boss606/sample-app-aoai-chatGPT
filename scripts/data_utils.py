@@ -38,6 +38,7 @@ load_dotenv() # take environment variables from .env.
 FILE_FORMAT_DICT = {
         "md": "markdown",
         "txt": "text",
+        "json": "text",  # IngestibleDocument JSON: content is plain text after extraction
         "html": "html",
         "shtml": "html",
         "htm": "html",
@@ -267,6 +268,13 @@ class Document(object):
     domain: Optional[str] = None
     contentVector: Optional[List[float]] = None
     image_mapping: Optional[Dict] = None
+    # Filterable top-level fields for Azure AI Search (legal domain)
+    court: Optional[str] = None
+    jurisdiction: Optional[str] = None
+    state: Optional[str] = None
+    source: Optional[str] = None
+    date_filed: Optional[str] = None
+    doc_type: Optional[str] = None
 
 def cleanup_content(content: str) -> str:
     """Cleans up the given content using regexes
@@ -779,7 +787,7 @@ def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None,
             elif FLAG_AOAI == "V3":   
                 embeddings = client.embeddings.create(model=deployment_id, 
                                                       input=text, 
-                                                      dimensions=int(os.getenv("VECTOR_DIMENSION", 1536)))
+                                                      dimensions=int(os.getenv("VECTOR_DIMENSION", 3072)))
             
             return embeddings.model_dump()['data'][0]['embedding']
         
