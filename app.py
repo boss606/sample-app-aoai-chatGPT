@@ -103,7 +103,7 @@ When answering legal questions:
 4. Note any recent changes in law or procedure
 5. Flag issues that may require judicial discretion
 6. ALWAYS reuse prior conversation content, attachments already processed, and documents from the index. NEVER say 'I don't have enough information' when you have: prior generated content, attachment content, or index context.
-7. When the user asks to expand, add arguments, summarize, or revise: expand based on the existing document and context. Consider sections such as: best interests of the child, balance of hardships, credibility analysis, burden of proof, statutory interpretation, public policy, case law analogies.
+7. When the user asks to expand, add arguments, summarize, or revise: base primarily on the existing document and response. You may use other sources or context provided (e.g. statutes, case law) to enrich the answer only when clearly related to the same topic as the document. If the document's topic is unrelated to those sources, expand only from the document—do not inject unrelated material.
 8. Use only the context provided for legal assertions. Do not invent statutes or cases not in the context.
 
 
@@ -1350,6 +1350,16 @@ async def conversation(request: Request):
         search_query = pick_search_query(messages)
         has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
 
+        # Attachments uploaded by user (PDF only) - extract early for context routing
+        blobs = data.get("blobs", [])
+        for b in blobs:
+            fn = (b.get("original_filename") or b.get("blob_name") or "").lower()
+            if not fn.endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file type. Only PDF is allowed.",
+                )
+
         legal_mode = False
         context_chunks = []
         no_context = False
@@ -1385,10 +1395,12 @@ async def conversation(request: Request):
                 print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
                 if legal_mode:
                     ctx = "\n\n".join(context_chunks)
+                    pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
                     chat_messages.append({
                         "role": "user",
                         "content": (
-                            "Use the context below (tagged by DOMAIN). Cite the sources. "
+                            pref
+                            + "Use the context below (tagged by DOMAIN). Cite the sources. "
                             "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
                             + ctx
                         )
@@ -1402,15 +1414,7 @@ async def conversation(request: Request):
         else:
             print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
 
-        # Attachments uploaded by user (PDF only)
-        blobs = data.get("blobs", [])
-        for b in blobs:
-            fn = (b.get("original_filename") or b.get("blob_name") or "").lower()
-            if not fn.endswith(".pdf"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported file type. Only PDF is allowed.",
-                )
+        # Attachments: build context (blobs already validated above)
         if blobs:
             try:
                 attachment_contexts = await _build_attachment_context(blobs, search_query or "legal", client)
@@ -1425,7 +1429,7 @@ async def conversation(request: Request):
             chat_messages.append({
                 "role": "user",
                 "content": (
-                    "Use ONLY the following attachment excerpts to answer. "
+                    "Use the following attachment excerpts to answer. "
                     "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
                     "Cite them as 'Attachment Source'.\n\n"
                     + "\n\n".join(attachment_contexts)
