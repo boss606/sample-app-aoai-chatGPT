@@ -1352,6 +1352,7 @@ async def conversation(request: Request):
 
         # Attachments uploaded by user (PDF only) - extract early for context routing
         blobs = data.get("blobs", [])
+        print(f"DEBUG: blobs count={len(blobs)} keys={list(data.keys())}", file=sys.stderr)
         for b in blobs:
             fn = (b.get("original_filename") or b.get("blob_name") or "").lower()
             if not fn.endswith(".pdf"):
