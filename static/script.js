@@ -892,12 +892,12 @@ async function addSelectedToChat() {
         });
     }
     
-    // Download OneDrive/email attachment files (apenas PDF)
+    // Download OneDrive/email attachment files (PDF only)
     for (var m = 0; m < files.length; m++) {
         var item = files[m];
         var ext = (item.name || '').split('.').pop().toLowerCase();
         if (ext !== 'pdf') {
-            addMessage('Arquivo "' + (item.name || '') + '" recusado. Apenas PDF é permitido.', 'system-error');
+            addMessage('File "' + (item.name || '') + '" rejected. Only PDF files are allowed.', 'system-error');
             continue;
         }
         try {
@@ -963,7 +963,7 @@ async function addSelectedToChat() {
         var boxFile = boxFiles[b];
         var boxExt = (boxFile.name || '').split('.').pop().toLowerCase();
         if (boxExt !== 'pdf') {
-            addMessage('Arquivo "' + (boxFile.name || '') + '" recusado. Apenas PDF é permitido.', 'system-error');
+            addMessage('File "' + (boxFile.name || '') + '" rejected. Only PDF files are allowed.', 'system-error');
             continue;
         }
         try {
@@ -1016,7 +1016,7 @@ async function handleFileSelect(event) {
         var file = files[i];
         var ext = (file.name || '').split('.').pop().toLowerCase();
         if (ext !== 'pdf') {
-            addMessage('Arquivo "' + file.name + '" recusado. Apenas PDF é permitido.', 'system-error');
+            addMessage('File "' + file.name + '" rejected. Only PDF files are allowed.', 'system-error');
             continue;
         }
         if (file.size > 50 * 1024 * 1024) {
