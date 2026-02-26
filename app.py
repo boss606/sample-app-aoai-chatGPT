@@ -174,7 +174,7 @@ LEGAL_TOP_PER_DOMAIN = int(os.getenv("LEGAL_TOP_PER_DOMAIN", "3"))
 # Defaults raised to support uploads with multiple large PDFs; adjust via env vars.
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "20"))
+MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "50"))
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-3-large; must match Azure Search index contentVector
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
