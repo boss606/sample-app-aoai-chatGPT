@@ -4,6 +4,7 @@ Main Application with Dashboard, Chat, Calculators, and M365 Integration
 Now with Function Calling for Emails, Calendar, and OneDrive
 """
 
+import gc
 import os
 import sys
 import io
@@ -175,6 +176,9 @@ LEGAL_TOP_PER_DOMAIN = int(os.getenv("LEGAL_TOP_PER_DOMAIN", "3"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "50"))
+# Optional: limit per-attachment size for chat flow (reduces memory); unset = use MAX_UPLOAD_BYTES
+_ATTACHMENT_MAX_MB = os.getenv("ATTACHMENT_MAX_SIZE_MB")
+ATTACHMENT_MAX_BYTES = int(_ATTACHMENT_MAX_MB) * 1024 * 1024 if _ATTACHMENT_MAX_MB else MAX_UPLOAD_BYTES
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-3-large; must match Azure Search index contentVector
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
@@ -595,17 +599,55 @@ def _safe_blob_name(filename: str, user_prefix: str = "") -> str:
     return name
 
 
+def _iter_pdf_text_pages(file_bytes: bytes):
+    """Generator yielding text from each PDF page (avoids building full list in memory)."""
+    reader = PdfReader(io.BytesIO(file_bytes))
+    for page in reader.pages:
+        yield page.extract_text() or ""
+
+
+def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int):
+    """Generator yielding OCR text from each PDF page (avoids accumulating ocr_chunks list)."""
+    from pdf2image import convert_from_bytes  # type: ignore
+    import pytesseract  # type: ignore
+
+    for page_num in range(1, max_pages + 1):
+        try:
+            images = convert_from_bytes(
+                file_bytes,
+                dpi=PDF_OCR_DPI,
+                first_page=page_num,
+                last_page=page_num,
+            )
+        except Exception as conv_err:
+            print(f"OCR conversion failed on page {page_num}: {conv_err}", file=sys.stderr)
+            continue
+
+        for img in images:
+            try:
+                txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
+            except Exception as ocr_err:
+                print(f"OCR failed on page {page_num}: {ocr_err}", file=sys.stderr)
+                continue
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            if txt.strip():
+                yield txt.strip()
+
+        del images
+
+
 def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
+    """Extract text from PDF using page-by-page generators to reduce memory usage."""
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        texts = []
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            texts.append(page_text)
-        content = "\n".join(texts).strip()
+        content = "\n".join(_iter_pdf_text_pages(file_bytes)).strip()
         if content:
             return content
 
+        reader = PdfReader(io.BytesIO(file_bytes))
         page_count = len(reader.pages)
         if not page_count:
             raise HTTPException(status_code=400, detail=f"PDF {filename} is empty or has no readable pages.")
@@ -631,39 +673,8 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
                 ),
             ) from import_err
 
-        # Convert one page at a time to avoid holding every rendered image in memory
         max_pages = min(page_count, PDF_OCR_MAX_PAGES)
-        ocr_chunks = []
-        for page_num in range(1, max_pages + 1):
-            try:
-                images = convert_from_bytes(
-                    file_bytes,
-                    dpi=PDF_OCR_DPI,
-                    first_page=page_num,
-                    last_page=page_num,
-                )
-            except Exception as conv_err:
-                print(f"OCR conversion failed on page {page_num}: {conv_err}", file=sys.stderr)
-                continue
-
-            for img in images:
-                try:
-                    txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
-                except Exception as ocr_err:
-                    print(f"OCR failed on page {page_num}: {ocr_err}", file=sys.stderr)
-                    continue
-                finally:
-                    try:
-                        img.close()
-                    except Exception:
-                        pass
-                if txt.strip():
-                    ocr_chunks.append(txt.strip())
-
-            # Explicitly drop page images before the next iteration
-            del images
-
-        ocr_content = "\n".join(ocr_chunks).strip()
+        ocr_content = "\n".join(_iter_pdf_ocr_pages(file_bytes, max_pages)).strip()
         if ocr_content:
             return ocr_content
 
@@ -706,9 +717,13 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b)) / denom
 
 
+EMBED_BATCH_SIZE = 24
+
+
 async def _build_attachment_context(blobs: List[dict], query: str, client: AzureOpenAI) -> List[str]:
     """
     Download, chunk, embed attachments and return top chunks as context strings.
+    Uses batching (24 chunks at a time) and explicit memory release to avoid OOM.
     """
     if not blobs:
         return []
@@ -740,39 +755,52 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         if not blob_name:
             continue
         file_bytes = b""
+        text = ""
         chunk_texts: List[str] = []
         try:
             file_bytes = storage.download_file(blob_name, container=upload_container)
-            if len(file_bytes) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {MAX_UPLOAD_SIZE_MB}MB limit.")
+            if len(file_bytes) > ATTACHMENT_MAX_BYTES:
+                limit_mb = int(_ATTACHMENT_MAX_MB) if _ATTACHMENT_MAX_MB else MAX_UPLOAD_SIZE_MB
+                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {limit_mb}MB limit.")
 
             if original_filename.lower().endswith(".pdf"):
                 text = _extract_text_from_pdf(file_bytes, original_filename)
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file type: {original_filename}. Only PDF is allowed.")
 
+            del file_bytes
+            gc.collect()
+
             chunk_texts = _chunk_text(text)
+            del text
+            gc.collect()
         except Exception:
             raise
-        # Do not delete blob here: follow-up messages in the same conversation
-        # need to re-download the attachment; blobs persist until explicitly cleaned.
 
         if not chunk_texts:
             continue
 
-        # Embed chunks for this file
-        embed_resp = client.embeddings.create(
-            model=EMBEDDING_DEPLOYMENT,
-            input=[str(c) for c in chunk_texts],
-            dimensions=VECTOR_DIMENSION,
-        )
-        scored: List[Tuple[float, str]] = []
-        for chunk_text, emb in zip(chunk_texts, embed_resp.data):
-            score = _cosine_similarity(query_vec, emb.embedding)
-            scored.append((score, str(chunk_text)))
+        # Embed in batches; keep top 3 per batch, then merge for global top 3
+        batch_top_scores: List[Tuple[float, str]] = []
+        for i in range(0, len(chunk_texts), EMBED_BATCH_SIZE):
+            batch = [str(c) for c in chunk_texts[i : i + EMBED_BATCH_SIZE]]
+            embed_resp = client.embeddings.create(
+                model=EMBEDDING_DEPLOYMENT,
+                input=batch,
+                dimensions=VECTOR_DIMENSION,
+            )
+            for chunk_text, emb in zip(batch, embed_resp.data):
+                score = _cosine_similarity(query_vec, emb.embedding)
+                batch_top_scores.append((score, chunk_text))
+            del embed_resp
+            gc.collect()
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top_chunks = scored[:top_chunks_per_file]
+        batch_top_scores.sort(key=lambda x: x[0], reverse=True)
+        top_chunks = batch_top_scores[:top_chunks_per_file]
+        del batch_top_scores
+        del chunk_texts
+        gc.collect()
+
         if not top_chunks:
             continue
 
