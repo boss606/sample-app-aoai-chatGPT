@@ -2,6 +2,8 @@
 var attachedFiles = [];
 var selectedEmails = [];
 var selectedCalendarEvents = [];
+// Pollers for attachment job status (job_id -> intervalId)
+var attachmentJobPollers = {};
 // Conversation history for backend continuity (reuse context across turns)
 var messageHistory = [];
 var searchSource = 'email';
@@ -928,12 +930,23 @@ async function addSelectedToChat() {
                 
                 if (!uploadResponse.ok) throw new Error('Upload failed');
                 
+                var regResp = await fetch('/api/register-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_name: urlData.blob_name, original_filename: item.name })
+                });
+                var regD = await regResp.json();
+                if (regD.error || !regD.job_id) throw new Error(regD.error || 'Attachment registration failed');
                 attachedFiles.push({
                     blob_name: urlData.blob_name,
                     original_filename: item.name,
-                    source: 'outlook'
+                    source: 'outlook',
+                    job_id: regD.job_id,
+                    status: regD.status || 'pending'
                 });
-                
+                if (regD.job_id && (regD.status === 'pending' || regD.status === 'processing')) {
+                    startAttachmentJobPolling(regD.job_id);
+                }
             } else if (item.type === 'onedrive-file') {
                 var response2 = await fetch('/api/download-graph-file', {
                     method: 'POST',
@@ -946,12 +959,23 @@ async function addSelectedToChat() {
                 
                 var data = await response2.json();
                 if (data.error) throw new Error(data.error);
-                
+                var regOd = await fetch('/api/register-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_name: data.blob_name, original_filename: data.original_filename })
+                });
+                var regOdData = await regOd.json();
+                if (regOdData.error || !regOdData.job_id) throw new Error(regOdData.error || 'Attachment registration failed');
                 attachedFiles.push({
                     blob_name: data.blob_name,
                     original_filename: data.original_filename,
-                    source: 'onedrive'
+                    source: 'onedrive',
+                    job_id: regOdData.job_id,
+                    status: regOdData.status || 'pending'
                 });
+                if (regOdData.job_id && (regOdData.status === 'pending' || regOdData.status === 'processing')) {
+                    startAttachmentJobPolling(regOdData.job_id);
+                }
             }
         } catch (error) {
             console.error('Failed to import ' + item.name + ':', error);
@@ -978,12 +1002,23 @@ async function addSelectedToChat() {
             
             var boxData = await boxResponse.json();
             if (boxData.error) throw new Error(boxData.error);
-            
+            var regBox = await fetch('/api/register-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ blob_name: boxData.blob_name, original_filename: boxData.original_filename })
+            });
+            var regBoxData = await regBox.json();
+            if (regBoxData.error || !regBoxData.job_id) throw new Error(regBoxData.error || 'Attachment registration failed');
             attachedFiles.push({
                 blob_name: boxData.blob_name,
                 original_filename: boxData.original_filename,
-                source: 'box'
+                source: 'box',
+                job_id: regBoxData.job_id,
+                status: regBoxData.status || 'pending'
             });
+            if (regBoxData.job_id && (regBoxData.status === 'pending' || regBoxData.status === 'processing')) {
+                startAttachmentJobPolling(regBoxData.job_id);
+            }
         } catch (error) {
             console.error('Failed to import Box file ' + boxFile.name + ':', error);
         }
@@ -1047,14 +1082,36 @@ async function handleFileSelect(event) {
 
             if (!uploadResponse.ok) throw new Error('Upload failed');
 
+            var regResponse = await fetch('/api/register-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    blob_name: urlData.blob_name,
+                    original_filename: file.name
+                })
+            });
+            var regData = await regResponse.json().catch(function() { return {}; });
+            if (!regResponse.ok || !regData.job_id) {
+                removeMessage(statusId);
+                addMessage('File uploaded but background processing failed. Please try again.', 'system-error');
+                return;
+            }
+            var jobId = regData.job_id;
+            var jobStatus = regData.status || 'pending';
+
             attachedFiles.push({
                 blob_name: urlData.blob_name,
                 original_filename: file.name,
                 size: file.size,
-                source: 'local'
+                source: 'local',
+                job_id: jobId,
+                status: jobStatus
             });
 
             updateAttachmentsUI();
+            if (jobStatus === 'pending' || jobStatus === 'processing') {
+                startAttachmentJobPolling(jobId);
+            }
             removeMessage(statusId);
 
         } catch (error) {
@@ -1064,6 +1121,36 @@ async function handleFileSelect(event) {
     }
 
     event.target.value = '';
+}
+
+function stopAttachmentJobPolling(jobId) {
+    if (attachmentJobPollers[jobId]) {
+        clearInterval(attachmentJobPollers[jobId]);
+        delete attachmentJobPollers[jobId];
+    }
+}
+
+function startAttachmentJobPolling(jobId) {
+    if (!jobId || attachmentJobPollers[jobId]) return;
+    var interval = 2000;
+    attachmentJobPollers[jobId] = setInterval(async function() {
+        try {
+            var r = await fetch('/api/jobs/' + jobId, { credentials: 'same-origin' });
+            if (!r.ok) return;
+            var data = await r.json();
+            var st = (data.status || '').toLowerCase();
+            if (st === 'completed' || st === 'failed') {
+                stopAttachmentJobPolling(jobId);
+                var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
+                if (f) {
+                    f.status = st;
+                    updateAttachmentsUI();
+                }
+            }
+        } catch (e) {
+            console.warn('Attachment job poll error:', e);
+        }
+    }, interval);
 }
 
 function updateAttachmentsUI() {
@@ -1107,10 +1194,11 @@ function updateAttachmentsUI() {
     
     attachedFiles.forEach(function(file, index) {
         var iconColor = file.source === 'outlook' ? 'var(--primary-500)' : file.source === 'onedrive' ? '#0ea5e9' : file.source === 'box' ? '#0061d5' : 'var(--gray-500)';
+        var statusHint = (file.status === 'pending' || file.status === 'processing') ? ' <span class="processing-badge"><i class="fas fa-spinner fa-spin"></i> Processing</span>' : (file.status === 'completed' ? ' <span class="ready-badge"><i class="fas fa-check-circle"></i></span>' : '');
         html += 
             '<div class="attachment-chip">' +
                 '<i class="fas ' + getFileIcon(file.original_filename) + '" style="color: ' + iconColor + ';"></i>' +
-                '<span class="name">' + escapeHtml(file.original_filename) + '</span>' +
+                '<span class="name">' + escapeHtml(file.original_filename) + statusHint + '</span>' +
                 '<span class="remove" onclick="removeAttachment(' + index + ')"><i class="fas fa-times"></i></span>' +
             '</div>';
     });
@@ -1140,7 +1228,9 @@ function getFileIconClass(filename) {
 
 async function removeAttachment(index) {
     var file = attachedFiles[index];
-    if (file && file.blob_name) {
+    if (file) {
+        if (file.job_id) stopAttachmentJobPolling(file.job_id);
+        if (file.blob_name) {
         try {
             await fetch('/api/delete-attachment', {
                 method: 'POST',
@@ -1150,6 +1240,7 @@ async function removeAttachment(index) {
             });
         } catch (e) {
             console.warn('Failed to delete blob on server:', e);
+        }
         }
     }
     attachedFiles.splice(index, 1);
@@ -1167,6 +1258,7 @@ function removeCalendarEvent(index) {
 }
 
 async function clearAllAttachments() {
+    attachedFiles.forEach(function(f) { if (f.job_id) stopAttachmentJobPolling(f.job_id); });
     // Delete blobs from storage before clearing
     if (attachedFiles.length > 0) {
         var blobNames = attachedFiles.map(function(f) { return f.blob_name; }).filter(Boolean);

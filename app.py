@@ -4,6 +4,7 @@ Main Application with Dashboard, Chat, Calculators, and M365 Integration
 Now with Function Calling for Emails, Calendar, and OneDrive
 """
 
+import asyncio
 import gc
 import os
 import sys
@@ -22,7 +23,7 @@ from typing import List, Tuple, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from openai import AzureOpenAI
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -41,6 +42,7 @@ from pypdf import PdfReader
 import tiktoken
 
 from backend.storage.blob_storage import LegalDocsStorage
+from backend.job_storage import get_job, create_job, update_job_status, get_job_storage_backend
 
 from dotenv import load_dotenv
 load_dotenv(override=False)
@@ -176,13 +178,14 @@ LEGAL_TOP_PER_DOMAIN = int(os.getenv("LEGAL_TOP_PER_DOMAIN", "3"))
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "200"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_ATTACHMENT_FILES = int(os.getenv("MAX_ATTACHMENT_FILES", "50"))
-# Optional: limit per-attachment size for chat flow (reduces memory); unset = use MAX_UPLOAD_BYTES
-_ATTACHMENT_MAX_MB = os.getenv("ATTACHMENT_MAX_SIZE_MB")
-ATTACHMENT_MAX_BYTES = int(_ATTACHMENT_MAX_MB) * 1024 * 1024 if _ATTACHMENT_MAX_MB else MAX_UPLOAD_BYTES
+# Optional: limit per-attachment size for chat flow; default 50MB to support 30-page high-res scans
+_ATTACHMENT_MAX_MB = os.getenv("ATTACHMENT_MAX_SIZE_MB", "50")
+ATTACHMENT_MAX_BYTES = int(_ATTACHMENT_MAX_MB) * 1024 * 1024
+ATTACHMENT_MAX_CHUNKS = int(os.getenv("ATTACHMENT_MAX_CHUNKS", "50"))
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-3-large; must match Azure Search index contentVector
-PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "20"))
-PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "200"))
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "30"))
+PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "150"))
 PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
 
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
@@ -274,6 +277,59 @@ def run_multi_domain_search(
             print(f"Fallback search error: {e}", file=sys.stderr)
 
     return context_chunks, domains_with_hits
+
+
+def run_user_attachment_search(
+    search_client: SearchClient,
+    query: str,
+    blob_names: List[str],
+    top_k: int = 6,
+    embed_client: Optional["AzureOpenAI"] = None,
+) -> List[str]:
+    """
+    Search user_attachment domain for the given blob_names (already indexed).
+    Returns context chunk strings for RAG.
+    """
+    if not blob_names:
+        return []
+    from azure.search.documents.models import VectorizedQuery
+    query_vector = None
+    if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
+        try:
+            emb = embed_client.embeddings.create(
+                model=EMBEDDING_DEPLOYMENT,
+                input=[query.strip()[:8000]],
+                dimensions=VECTOR_DIMENSION,
+            )
+            query_vector = emb.data[0].embedding
+        except Exception as e:
+            print(f"[UserAttachment] Embedding error: {e}", file=sys.stderr)
+    safe_sources = [s.replace("'", "''") for s in blob_names if s]
+    if not safe_sources:
+        return []
+    source_filter = " or ".join(f"source eq '{s}'" for s in safe_sources)
+    filter_str = f"domain eq 'user_attachment' and ({source_filter})"
+    kwargs = {
+        "search_text": query,
+        "top": top_k,
+        "filter": filter_str,
+    }
+    if query_vector:
+        kwargs["vector_queries"] = [
+            VectorizedQuery(vector=query_vector, k_nearest_neighbors=top_k, fields="contentVector")
+        ]
+    context_chunks = []
+    try:
+        results = search_client.search(**kwargs)
+        for r in results:
+            content = (r.get("content") or "").strip()
+            source = r.get("filepath") or r.get("source") or ""
+            title = r.get("title") or source
+            if content:
+                context_chunks.append(f"[Attachment: {title}]\n{content}")
+    except Exception as e:
+        print(f"[UserAttachment] Search error: {e}", file=sys.stderr)
+    return context_chunks
 
 
 # Define tools for function calling
@@ -638,6 +694,7 @@ def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int):
                 yield txt.strip()
 
         del images
+        gc.collect()
 
 
 def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
@@ -652,6 +709,8 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
         if not page_count:
             raise HTTPException(status_code=400, detail=f"PDF {filename} is empty or has no readable pages.")
 
+        max_pages = min(page_count, PDF_OCR_MAX_PAGES)
+        print(f"[PDF] OCR needed for {filename}: {page_count} pages, processing {max_pages}", file=sys.stderr)
         if page_count > PDF_OCR_MAX_PAGES:
             raise HTTPException(
                 status_code=400,
@@ -673,7 +732,6 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
                 ),
             ) from import_err
 
-        max_pages = min(page_count, PDF_OCR_MAX_PAGES)
         ocr_content = "\n".join(_iter_pdf_ocr_pages(file_bytes, max_pages)).strip()
         if ocr_content:
             return ocr_content
@@ -692,21 +750,53 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to read PDF {filename}: {e}")
 
 
+_tiktoken_encoder: Optional[object] = "unset"  # "unset" | encoder | None (failed, use fallback)
+
+
+def _get_tiktoken_encoder():
+    """Lazy-load tiktoken encoder. Returns None if network unavailable (offline)."""
+    global _tiktoken_encoder
+    if _tiktoken_encoder != "unset":
+        return _tiktoken_encoder if _tiktoken_encoder is not None else None
+    try:
+        _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+        return _tiktoken_encoder
+    except Exception as e:
+        print(f"[Chunk] tiktoken unavailable ({e}), using char-based fallback", file=sys.stderr)
+        _tiktoken_encoder = None
+        return None
+
+
 def _chunk_text(text: str, max_tokens: int = 350, overlap: int = 60, max_chunks: int = 200) -> List[str]:
     """
-    Simple token-based chunker using tiktoken. Returns a list of chunk strings.
+    Tries tiktoken first (exact token counting). Falls back to char-based chunking
+    when tiktoken cannot load (e.g. offline / network unreachable).
     """
-    encoder = tiktoken.get_encoding("cl100k_base")
-    tokens = encoder.encode(text)
+    encoder = _get_tiktoken_encoder()
+    if encoder is not None:
+        tokens = encoder.encode(text)
+        chunks = []
+        start = 0
+        while start < len(tokens) and len(chunks) < max_chunks:
+            end = min(start + max_tokens, len(tokens))
+            chunk_tokens = tokens[start:end]
+            chunks.append(encoder.decode(chunk_tokens))
+            if end == len(tokens):
+                break
+            start = end - overlap
+        return chunks
+
+    # Fallback: ~4 chars/token, 350 tokens ~1400 chars, 60 overlap ~240 chars
+    chunk_size = max_tokens * 4
+    overlap_chars = overlap * 4
     chunks = []
     start = 0
-    while start < len(tokens) and len(chunks) < max_chunks:
-        end = min(start + max_tokens, len(tokens))
-        chunk_tokens = tokens[start:end]
-        chunks.append(encoder.decode(chunk_tokens))
-        if end == len(tokens):
+    while start < len(text) and len(chunks) < max_chunks:
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
             break
-        start = end - overlap
+        start = end - overlap_chars
     return chunks
 
 
@@ -723,7 +813,7 @@ EMBED_BATCH_SIZE = 24
 async def _build_attachment_context(blobs: List[dict], query: str, client: AzureOpenAI) -> List[str]:
     """
     Download, chunk, embed attachments and return top chunks as context strings.
-    Uses batching (24 chunks at a time) and explicit memory release to avoid OOM.
+    Uses batching (24 chunks at a time), thread pool for blocking I/O, and explicit memory release to avoid OOM.
     """
     if not blobs:
         return []
@@ -738,16 +828,18 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
     attachment_sections: List[str] = []
     top_chunks_per_file = 3
 
-    # Embed query once
+    # Embed query once (run in thread to avoid blocking event loop)
     safe_query = str(query or "legal question")
-    print("EMBED INPUT TYPE:", type(safe_query), file=sys.stderr)
-    print("EMBED INPUT PREVIEW:", repr(safe_query)[:500], file=sys.stderr)
-    query_embed_resp = client.embeddings.create(
-        model=EMBEDDING_DEPLOYMENT,
-        input=[safe_query],
-        dimensions=VECTOR_DIMENSION,
+    t0 = time.perf_counter()
+    query_embed_resp = await asyncio.to_thread(
+        lambda: client.embeddings.create(
+            model=EMBEDDING_DEPLOYMENT,
+            input=[safe_query],
+            dimensions=VECTOR_DIMENSION,
+        )
     )
     query_vec = query_embed_resp.data[0].embedding
+    print(f"[Attachment] Query embed done in {time.perf_counter() - t0:.2f}s", file=sys.stderr)
 
     for blob in blobs:
         blob_name = blob.get("blob_name")
@@ -758,42 +850,53 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         text = ""
         chunk_texts: List[str] = []
         try:
-            file_bytes = storage.download_file(blob_name, container=upload_container)
+            t_dl = time.perf_counter()
+            file_bytes = await asyncio.to_thread(storage.download_file, blob_name, container=upload_container)
+            print(f"[Attachment] Downloaded {original_filename}: {len(file_bytes)} bytes in {time.perf_counter() - t_dl:.2f}s", file=sys.stderr)
+
             if len(file_bytes) > ATTACHMENT_MAX_BYTES:
-                limit_mb = int(_ATTACHMENT_MAX_MB) if _ATTACHMENT_MAX_MB else MAX_UPLOAD_SIZE_MB
-                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {limit_mb}MB limit.")
+                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {_ATTACHMENT_MAX_MB}MB limit. Use a smaller PDF or increase ATTACHMENT_MAX_SIZE_MB.")
 
             if original_filename.lower().endswith(".pdf"):
-                text = _extract_text_from_pdf(file_bytes, original_filename)
+                t_ext = time.perf_counter()
+                text = await asyncio.to_thread(_extract_text_from_pdf, file_bytes, original_filename)
+                print(f"[Attachment] PDF extract done for {original_filename} in {time.perf_counter() - t_ext:.2f}s", file=sys.stderr)
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file type: {original_filename}. Only PDF is allowed.")
 
             del file_bytes
             gc.collect()
 
-            chunk_texts = _chunk_text(text)
+            chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
             del text
             gc.collect()
+            print(f"[Attachment] Chunked {original_filename}: {len(chunk_texts)} chunks", file=sys.stderr)
         except Exception:
             raise
 
         if not chunk_texts:
             continue
 
-        # Embed in batches; keep top 3 per batch, then merge for global top 3
+        # Embed in batches; keep top 3 per batch, then merge for global top 3 (run in thread)
         batch_top_scores: List[Tuple[float, str]] = []
+        n_batches = (len(chunk_texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
         for i in range(0, len(chunk_texts), EMBED_BATCH_SIZE):
             batch = [str(c) for c in chunk_texts[i : i + EMBED_BATCH_SIZE]]
-            embed_resp = client.embeddings.create(
-                model=EMBEDDING_DEPLOYMENT,
-                input=batch,
-                dimensions=VECTOR_DIMENSION,
+            batch_idx = i // EMBED_BATCH_SIZE + 1
+            t_emb = time.perf_counter()
+            embed_resp = await asyncio.to_thread(
+                lambda b=batch: client.embeddings.create(
+                    model=EMBEDDING_DEPLOYMENT,
+                    input=b,
+                    dimensions=VECTOR_DIMENSION,
+                )
             )
             for chunk_text, emb in zip(batch, embed_resp.data):
                 score = _cosine_similarity(query_vec, emb.embedding)
                 batch_top_scores.append((score, chunk_text))
             del embed_resp
             gc.collect()
+            print(f"[Attachment] Embed batch {batch_idx}/{n_batches} ({len(batch)} chunks) in {time.perf_counter() - t_emb:.2f}s", file=sys.stderr)
 
         batch_top_scores.sort(key=lambda x: x[0], reverse=True)
         top_chunks = batch_top_scores[:top_chunks_per_file]
@@ -810,6 +913,116 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
         attachment_sections.append("\n".join(section_lines))
 
     return attachment_sections
+
+
+def _check_search_connectivity(search_service: str, label: str = "Attachment") -> Optional[str]:
+    """Test connectivity to Azure Search. Returns None if OK, error message if failed."""
+    import socket
+    import threading
+    host = f"{search_service}.search.windows.net"
+    port = 443
+    thread_name = threading.current_thread().name
+    try:
+        print(f"[{label}] Connectivity check (thread={thread_name}): resolving {host}...", file=sys.stderr)
+        ip = socket.gethostbyname(host)
+        print(f"[{label}] Resolved {host} -> {ip}", file=sys.stderr)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((host, port))
+        sock.close()
+        print(f"[{label}] TCP connection to {host}:{port} OK (thread={thread_name})", file=sys.stderr)
+        return None
+    except socket.gaierror as e:
+        err = f"DNS/resolution failed for {host}: {e}"
+        print(f"[{label}] {err}", file=sys.stderr)
+        return err
+    except OSError as e:
+        err = f"Connection to {host}:{port} failed (errno={getattr(e, 'errno', '?')}): {e}"
+        print(f"[{label}] {err}", file=sys.stderr)
+        return err
+
+
+def process_attachment_job(job_id: str, partition_key: str, blob_name: str, original_filename: str):
+    """
+    Background task: download blob, extract PDF, chunk, embed, index to Azure Search.
+    Updates job status to completed or failed.
+    """
+    try:
+        update_job_status(partition_key, job_id, "processing")
+        search_service = os.getenv("AZURE_SEARCH_SERVICE")
+        if search_service:
+            conn_err = _check_search_connectivity(search_service, label="BackgroundTask")
+            if conn_err:
+                print(f"[Attachment] Pre-flight failed: {conn_err}", file=sys.stderr)
+                update_job_status(partition_key, job_id, "failed", conn_err)
+                return
+        storage = LegalDocsStorage()
+        upload_container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
+
+        file_bytes = storage.download_file(blob_name, container=upload_container)
+        if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
+            update_job_status(partition_key, job_id, "failed", "File too large or empty")
+            return
+        text = _extract_text_from_pdf(file_bytes, original_filename)
+        del file_bytes
+        gc.collect()
+        chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
+        del text
+        gc.collect()
+        if not chunk_texts:
+            update_job_status(partition_key, job_id, "completed")  # No text, nothing to index
+            return
+
+        key = os.getenv("AZURE_OPENAI_KEY")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        search_service = os.getenv("AZURE_SEARCH_SERVICE")
+        search_index = os.getenv("AZURE_SEARCH_INDEX")
+        search_key = os.getenv("AZURE_SEARCH_KEY")
+        if not all([key, endpoint, search_service, search_index, search_key]):
+            update_job_status(partition_key, job_id, "failed", "Azure config missing")
+            return
+
+        client = AzureOpenAI(api_key=key, azure_endpoint=endpoint, api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"))
+        search_client = SearchClient(
+            f"https://{search_service}.search.windows.net",
+            search_index,
+            AzureKeyCredential(search_key),
+        )
+        blob_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", blob_name.replace("/", "_").replace(".pdf", ""))[:64]
+        docs_to_upload = []
+        for i in range(0, len(chunk_texts), EMBED_BATCH_SIZE):
+            batch = [str(c) for c in chunk_texts[i : i + EMBED_BATCH_SIZE]]
+            emb_resp = client.embeddings.create(
+                model=EMBEDDING_DEPLOYMENT,
+                input=batch,
+                dimensions=VECTOR_DIMENSION,
+            )
+            for idx, (chunk_text, emb_obj) in enumerate(zip(batch, emb_resp.data)):
+                chunk_id = f"{blob_stem}-{i + idx}"
+                docs_to_upload.append({
+                    "@search.action": "upload",
+                    "id": chunk_id,
+                    "content": chunk_text,
+                    "domain": "user_attachment",
+                    "source": blob_name,
+                    "filepath": blob_name,
+                    "title": original_filename,
+                    "metadata": json.dumps({"original_filename": original_filename}),
+                    "contentVector": emb_obj.embedding,
+                })
+            del emb_resp
+            gc.collect()
+        if docs_to_upload:
+            batch_size = 50
+            for j in range(0, len(docs_to_upload), batch_size):
+                search_client.upload_documents(documents=docs_to_upload[j : j + batch_size])
+        update_job_status(partition_key, job_id, "completed")
+        print(f"[Attachment] Job {job_id} completed: {blob_name} -> {len(docs_to_upload)} chunks", file=sys.stderr)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        update_job_status(partition_key, job_id, "failed", str(e))
+        print(f"[Attachment] Job {job_id} failed: {e}", file=sys.stderr)
 
 
 # ============== Tool Execution Functions ==============
@@ -1291,6 +1504,70 @@ async def delete_attachment(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/register-attachment")
+async def register_attachment(request: Request, background_tasks: BackgroundTasks):
+    """Register an uploaded blob for background processing. Returns job_id."""
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    print("[register-attachment] endpoint called", file=sys.stderr)
+    search_svc = os.getenv("AZURE_SEARCH_SERVICE")
+    if search_svc:
+        conn_err = _check_search_connectivity(search_svc, label="register-attachment")
+        if conn_err:
+            print(f"[register-attachment] WARNING: Search unreachable from main request: {conn_err}", file=sys.stderr)
+    try:
+        data = await request.json()
+        blob_name = (data.get("blob_name") or "").strip()
+        original_filename = (data.get("original_filename") or "file.pdf").strip()
+        if not blob_name:
+            raise HTTPException(status_code=400, detail="blob_name is required")
+        if not _user_owns_blob(request, blob_name):
+            raise HTTPException(status_code=403, detail="Blob does not belong to user")
+
+        job_id = str(uuid.uuid4())
+        user_prefix = _get_user_blob_prefix(request)
+        if not create_job(user_prefix, job_id, blob_name, original_filename):
+            raise HTTPException(status_code=500, detail="Failed to create job")
+
+        background_tasks.add_task(process_attachment_job, job_id, user_prefix, blob_name, original_filename)
+        return JSONResponse({
+            "job_id": job_id,
+            "blob_name": blob_name,
+            "status": "pending",
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/job-storage-status")
+async def job_storage_status():
+    """Return which backend is used for job storage: azure_table or in_memory."""
+    backend = get_job_storage_backend()
+    return JSONResponse({"backend": backend, "using_azure_table": backend == "azure_table"})
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str, request: Request):
+    """Get status of an attachment processing job."""
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_prefix = _get_user_blob_prefix(request)
+    job = get_job(user_prefix, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    status = job.get("status", "unknown")
+    return JSONResponse({
+        "job_id": job_id,
+        "status": status,
+        "blob_name": job.get("blob_name"),
+        "original_filename": job.get("original_filename"),
+        "error": job.get("error") if status == "failed" else None,
+    })
+
+
 @app.post("/api/conversation")
 @app.post("/api/agentic")
 async def conversation(request: Request):
@@ -1393,13 +1670,15 @@ async def conversation(request: Request):
         context_chunks = []
         no_context = False
         attachment_contexts: List[str] = []
-        if search_service and search_index and search_key and search_query:
+        # Create SearchClient once and reuse for Legal RAG + UserAttachment (avoids duplicate connections)
+        search_client = None
+        if search_service and search_index and search_key:
+            search_endpoint = f"https://{search_service}.search.windows.net"
+            search_client = SearchClient(
+                search_endpoint, search_index, AzureKeyCredential(search_key)
+            )
+        if search_client and search_query:
             try:
-                search_endpoint = f"https://{search_service}.search.windows.net"
-                search_client = SearchClient(
-                    search_endpoint, search_index, AzureKeyCredential(search_key)
-                )
-
                 request_domains = data.get("domains", [])
                 if isinstance(request_domains, str):
                     request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
@@ -1443,15 +1722,57 @@ async def conversation(request: Request):
         else:
             print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
 
-        # Attachments: build context (blobs already validated above)
+        # Attachments: use indexed content (RAG) when job_id present; legacy inline processing disabled (caused timeout/OOM)
         if blobs:
-            try:
-                attachment_contexts = await _build_attachment_context(blobs, search_query or "legal", client)
-            except HTTPException:
-                raise
-            except Exception as attach_err:
-                print(f"Attachment processing error: {attach_err}", file=sys.stderr)
-                raise HTTPException(status_code=500, detail=f"Attachment processing failed: {attach_err}")
+            user_prefix = _get_user_blob_prefix(request)
+            blobs_with_job = [b for b in blobs if b.get("job_id")]
+            blobs_without_job = [b for b in blobs if not b.get("job_id")]
+            if blobs_without_job:
+                names = [b.get("original_filename", "file") for b in blobs_without_job]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
+                )
+            processing_names = []
+            failed_jobs = []
+            ready_blob_names = []
+            for b in blobs_with_job:
+                job_id = b.get("job_id")
+                blob_name = b.get("blob_name")
+                orig = b.get("original_filename", "file.pdf")
+                if not job_id or not blob_name:
+                    continue
+                job = get_job(user_prefix, job_id)
+                if not job:
+                    processing_names.append(orig)
+                    continue
+                st = job.get("status", "pending")
+                if st == "completed":
+                    ready_blob_names.append(blob_name)
+                elif st == "failed":
+                    failed_jobs.append((orig, job.get("error", "Unknown error")))
+                else:
+                    processing_names.append(orig)
+            if processing_names:
+                msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
+                return JSONResponse({"job_id": str(uuid.uuid4()), "status": "processing", "response": msg})
+            if failed_jobs:
+                err_parts = [f"{n}: {e}" for n, e in failed_jobs]
+                raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
+            if ready_blob_names and search_client:
+                try:
+                    attach_chunks = run_user_attachment_search(
+                        search_client=search_client,
+                        query=search_query or "legal",
+                        blob_names=ready_blob_names,
+                        top_k=6,
+                        embed_client=client,
+                    )
+                    if attach_chunks:
+                        attachment_contexts.extend(attach_chunks)
+                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
+                except Exception as ua_err:
+                    print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
 
         if attachment_contexts:
             no_context = False

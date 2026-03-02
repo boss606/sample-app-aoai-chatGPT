@@ -6,6 +6,7 @@ azure-ai-documentintelligence==1.0.2
 azure-ai-formrecognizer==3.3.3
 azure-common==1.1.28
 azure-core==1.37.0
+azure-data-tables==12.7.0
 azure-identity==1.25.1
 azure-search-documents==11.6.0
 azure-storage-blob==12.27.1
@@ -43,11 +44,15 @@ MarkupSafe==3.0.3
 msal==1.34.0
 msal-extensions==1.3.1
 msrest==0.7.1
+multidict==6.7.1
 oauthlib==3.3.1
 openai==2.11.0
 orjson==3.11.5
 ormsgpack==1.12.1
 packaging==25.0
+pdf2image==1.17.0
+pillow==11.1.0
+propcache==0.4.1
 pycparser==2.23
 pydantic==2.12.5
 pydantic_core==2.41.5
@@ -55,8 +60,6 @@ PyJWT==2.10.1
 PyMuPDF==1.26.7
 pypdf==6.4.2
 PyPDF2==3.0.1
-pdf2image==1.17.0
-Pillow==11.1.0
 pytesseract==0.3.13
 python-dotenv==1.2.1
 python-multipart==0.0.20
@@ -77,4 +80,5 @@ urllib3==2.6.2
 uuid_utils==0.12.0
 uvicorn==0.38.0
 xxhash==3.6.0
+yarl==1.22.0
 zstandard==0.25.0
