@@ -116,3 +116,66 @@ def update_job_status(partition_key: str, job_id: str, status: str, error: Optio
             _in_memory_jobs[key]["error"] = str(error)[:1000]
         return True
     return False
+
+
+def create_agentic_job(partition_key: str, job_id: str) -> bool:
+    """Create an agentic/chat job with status pending."""
+    now = datetime.now(timezone.utc).isoformat()
+    entity = {
+        "PartitionKey": partition_key,
+        "RowKey": job_id,
+        "blob_name": "",
+        "original_filename": "",
+        "status": "pending",
+        "response": "",
+        "error": "",
+        "created_at": now,
+    }
+    table = _ensure_table()
+    if table:
+        try:
+            table.create_entity(entity=entity)
+            return True
+        except Exception as e:
+            print(f"[JobStorage] Create agentic failed: {e}", file=__import__("sys").stderr)
+            return False
+    _in_memory_jobs[f"{partition_key}:{job_id}"] = {
+        "PartitionKey": partition_key,
+        "RowKey": job_id,
+        "blob_name": "",
+        "original_filename": "",
+        "status": "pending",
+        "response": "",
+        "error": "",
+        "created_at": now,
+    }
+    return True
+
+
+def update_agentic_job(
+    partition_key: str, job_id: str, status: str, response: Optional[str] = None, error: Optional[str] = None
+) -> bool:
+    """Update agentic job status and optionally response/error."""
+    table = _ensure_table()
+    if table:
+        try:
+            entity = table.get_entity(partition_key=partition_key, row_key=job_id)
+            entity["status"] = status
+            if response is not None:
+                entity["response"] = str(response)[:50000]  # Cap very long responses
+            if error is not None:
+                entity["error"] = str(error)[:1000]
+            table.update_entity(entity=entity)
+            return True
+        except Exception as e:
+            print(f"[JobStorage] Update agentic failed: {e}", file=__import__("sys").stderr)
+            return False
+    key = f"{partition_key}:{job_id}"
+    if key in _in_memory_jobs:
+        _in_memory_jobs[key]["status"] = status
+        if response is not None:
+            _in_memory_jobs[key]["response"] = str(response)[:50000]
+        if error is not None:
+            _in_memory_jobs[key]["error"] = str(error)[:1000]
+        return True
+    return False

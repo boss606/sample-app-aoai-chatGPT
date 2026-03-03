@@ -51,16 +51,16 @@ def main():
         print("DRY RUN: no changes will be made")
 
     storage = LegalDocsStorage()
-    # Only frontend blobs: prefix u_{hash}/ + PDF (only format accepted on upload)
+    # Only frontend blobs: prefix u_{hash}/ + PDF or Word
     # Other paths (california/, court_forms/, etc.) are from data_ingestion/scripts - do not touch
     FRONTEND_PREFIX = "u_"
     blobs_with_ts = storage.list_blobs_with_timestamps(
         prefix=FRONTEND_PREFIX,
-        extensions=(".pdf",),  # Frontend accepts PDF only
+        extensions=(".pdf", ".docx"),
     )
 
     to_delete = [(name, lm) for name, lm in blobs_with_ts if lm < cutoff]
-    print(f"Found {len(blobs_with_ts)} frontend PDF blobs (u_*), {len(to_delete)} older than {MAX_AGE_HOURS}h")
+    print(f"Found {len(blobs_with_ts)} frontend blobs (u_*), {len(to_delete)} older than {MAX_AGE_HOURS}h")
 
     if not to_delete:
         return 0

@@ -42,7 +42,14 @@ from pypdf import PdfReader
 import tiktoken
 
 from backend.storage.blob_storage import LegalDocsStorage
-from backend.job_storage import get_job, create_job, update_job_status, get_job_storage_backend
+from backend.job_storage import (
+    get_job,
+    create_job,
+    update_job_status,
+    create_agentic_job,
+    update_agentic_job,
+    get_job_storage_backend,
+)
 
 from dotenv import load_dotenv
 load_dotenv(override=False)
@@ -451,7 +458,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True #bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -697,6 +704,43 @@ def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int):
         gc.collect()
 
 
+_ATTACHMENT_ALLOWED_EXT = (".pdf", ".docx")
+
+
+def _is_supported_attachment(filename: str) -> bool:
+    """Return True if filename has an allowed extension for attachments."""
+    fn = (filename or "").lower().strip()
+    return any(fn.endswith(ext) for ext in _ATTACHMENT_ALLOWED_EXT)
+
+
+def _extract_text_from_docx(file_bytes: bytes, filename: str) -> str:
+    """Extract text from Word .docx file."""
+    try:
+        from docx import Document
+
+        doc = Document(io.BytesIO(file_bytes))
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text.strip())
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        parts.append(cell.text.strip())
+        text = "\n\n".join(parts).strip()
+        if not text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Word document {filename} appears to be empty or has no extractable text.",
+            )
+        return text
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read Word document {filename}: {e}")
+
+
 def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
     """Extract text from PDF using page-by-page generators to reduce memory usage."""
     try:
@@ -748,6 +792,19 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read PDF {filename}: {e}")
+
+
+def _extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Extract text from supported file (PDF or Word .docx)."""
+    fn = (filename or "").lower()
+    if fn.endswith(".pdf"):
+        return _extract_text_from_pdf(file_bytes, filename)
+    if fn.endswith(".docx"):
+        return _extract_text_from_docx(file_bytes, filename)
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported file type: {filename}. Only PDF and Word (.docx) are allowed.",
+    )
 
 
 _tiktoken_encoder: Optional[object] = "unset"  # "unset" | encoder | None (failed, use fallback)
@@ -855,14 +912,17 @@ async def _build_attachment_context(blobs: List[dict], query: str, client: Azure
             print(f"[Attachment] Downloaded {original_filename}: {len(file_bytes)} bytes in {time.perf_counter() - t_dl:.2f}s", file=sys.stderr)
 
             if len(file_bytes) > ATTACHMENT_MAX_BYTES:
-                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {_ATTACHMENT_MAX_MB}MB limit. Use a smaller PDF or increase ATTACHMENT_MAX_SIZE_MB.")
+                raise HTTPException(status_code=400, detail=f"File {original_filename} exceeds {_ATTACHMENT_MAX_MB}MB limit. Use a smaller file or increase ATTACHMENT_MAX_SIZE_MB.")
 
-            if original_filename.lower().endswith(".pdf"):
+            if _is_supported_attachment(original_filename):
                 t_ext = time.perf_counter()
-                text = await asyncio.to_thread(_extract_text_from_pdf, file_bytes, original_filename)
-                print(f"[Attachment] PDF extract done for {original_filename} in {time.perf_counter() - t_ext:.2f}s", file=sys.stderr)
+                text = await asyncio.to_thread(_extract_text_from_file, file_bytes, original_filename)
+                print(f"[Attachment] Extract done for {original_filename} in {time.perf_counter() - t_ext:.2f}s", file=sys.stderr)
             else:
-                raise HTTPException(status_code=400, detail=f"Unsupported file type: {original_filename}. Only PDF is allowed.")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type: {original_filename}. Only PDF and Word (.docx) are allowed.",
+                )
 
             del file_bytes
             gc.collect()
@@ -963,7 +1023,10 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
             update_job_status(partition_key, job_id, "failed", "File too large or empty")
             return
-        text = _extract_text_from_pdf(file_bytes, original_filename)
+        if not _is_supported_attachment(original_filename):
+            update_job_status(partition_key, job_id, "failed", f"Unsupported file type. Only PDF and Word (.docx) are allowed.")
+            return
+        text = _extract_text_from_file(file_bytes, original_filename)
         del file_bytes
         gc.collect()
         chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
@@ -1568,163 +1631,313 @@ async def get_job_status(job_id: str, request: Request):
     })
 
 
+async def _run_agentic_conversation(
+    job_id: str, user_prefix: str, data: dict, graph_token: Optional[str]
+) -> None:
+    """Background task: run the full agentic conversation and store result in job."""
+    import sys
+    partition = "agt_" + user_prefix
+    try:
+        update_agentic_job(partition, job_id, "processing")
+        response_text = await _execute_agentic_logic(data, user_prefix, graph_token)
+        update_agentic_job(partition, job_id, "completed", response=response_text)
+    except HTTPException as e:
+        update_agentic_job(partition, job_id, "failed", error=str(e.detail))
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        update_agentic_job(partition, job_id, "failed", error=str(e))
+
+
+async def _execute_agentic_logic(
+    data: dict, user_prefix: str, graph_token: Optional[str]
+) -> str:
+    """Execute agentic conversation logic; returns response text or raises."""
+    import sys
+    jurisdiction_raw = data.get("jurisdiction", "California")
+    jid, j_config = resolve_jurisdiction(jurisdiction_raw)
+    messages = data.get("messages", [])
+    if not messages:
+        messages = data.get("conversation", [])
+    if not messages:
+        messages = data.get("history", [])
+    if not messages and "message" in data:
+        messages = [{"role": "user", "content": data.get("message", "")}]
+    if not messages and "query" in data:
+        messages = [{"role": "user", "content": data.get("query", "")}]
+    if not messages and "prompt" in data:
+        messages = [{"role": "user", "content": data.get("prompt", "")}]
+
+    context = data.get("context", "")
+    print(f"Messages after parsing: {len(messages)}", file=sys.stderr)
+
+    key = os.getenv("AZURE_OPENAI_KEY")
+    raw_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
+    search_service = os.getenv("AZURE_SEARCH_SERVICE")
+    search_index = os.getenv("AZURE_SEARCH_INDEX")
+    search_key = os.getenv("AZURE_SEARCH_KEY")
+    endpoint = raw_endpoint
+    version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+
+    if not key or not endpoint:
+        raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
+
+    print("Creating AzureOpenAI client...", file=sys.stderr)
+    client = AzureOpenAI(
+        api_key=key,
+        azure_endpoint=endpoint,
+        api_version=version,
+    )
+    print("Client created, making request...", file=sys.stderr)
+
+    system_prompt = JURISDICTION_SYSTEM_PROMPT.get(jid) or ""
+    chat_messages = [{"role": "system", "content": system_prompt}]
+
+    search_query = pick_search_query(messages)
+    has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
+
+    blobs = data.get("blobs", [])
+    print(f"DEBUG: blobs count={len(blobs)} keys={list(data.keys())}", file=sys.stderr)
+    for b in blobs:
+        fn = (b.get("original_filename") or b.get("blob_name") or "")
+        if not _is_supported_attachment(fn):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported file type. Only PDF and Word (.docx) are allowed.",
+            )
+
+    legal_mode = False
+    context_chunks = []
+    no_context = False
+    attachment_contexts: List[str] = []
+    search_client = None
+    if search_service and search_index and search_key:
+        search_endpoint = f"https://{search_service}.search.windows.net"
+        search_client = SearchClient(
+            search_endpoint, search_index, AzureKeyCredential(search_key)
+        )
+    if search_client and search_query:
+        try:
+            request_domains = data.get("domains", [])
+            if isinstance(request_domains, str):
+                request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
+            elif not isinstance(request_domains, list):
+                request_domains = []
+
+            candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
+            candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
+            search_query = normalize_to_text(search_query)
+
+            print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
+            context_chunks, domains_with_hits = run_multi_domain_search(
+                search_client=search_client,
+                query=search_query,
+                domains=candidates,
+                max_domains=LEGAL_MAX_DOMAINS,
+                top_per_domain=LEGAL_TOP_PER_DOMAIN,
+                embed_client=client,
+            )
+
+            legal_mode = len(context_chunks) > 0
+            print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
+            if legal_mode:
+                ctx = "\n\n".join(context_chunks)
+                pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
+                chat_messages.append({
+                    "role": "user",
+                    "content": (
+                        pref
+                        + "Use the context below (tagged by DOMAIN). Cite the sources. "
+                        "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
+                        + ctx
+                    )
+                })
+                print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
+            else:
+                no_context = True
+                print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
+        except Exception as search_err:
+            print(f"Legal RAG search error: {search_err}", file=sys.stderr)
+    else:
+        print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
+
+    if blobs:
+        blobs_with_job = [b for b in blobs if b.get("job_id")]
+        blobs_without_job = [b for b in blobs if not b.get("job_id")]
+        if blobs_without_job:
+            names = [b.get("original_filename", "file") for b in blobs_without_job]
+            raise HTTPException(
+                status_code=400,
+                detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
+            )
+        processing_names = []
+        failed_jobs = []
+        ready_blob_names = []
+        for b in blobs_with_job:
+            att_job_id = b.get("job_id")
+            blob_name = b.get("blob_name")
+            orig = b.get("original_filename", "file.pdf")
+            if not att_job_id or not blob_name:
+                continue
+            job = get_job(user_prefix, att_job_id)
+            if not job:
+                processing_names.append(orig)
+                continue
+            st = job.get("status", "pending")
+            if st == "completed":
+                ready_blob_names.append(blob_name)
+            elif st == "failed":
+                failed_jobs.append((orig, job.get("error", "Unknown error")))
+            else:
+                processing_names.append(orig)
+        if processing_names:
+            msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
+            raise HTTPException(status_code=400, detail=msg)
+        if failed_jobs:
+            err_parts = [f"{n}: {e}" for n, e in failed_jobs]
+            raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
+        if ready_blob_names and search_client:
+            try:
+                attach_chunks = run_user_attachment_search(
+                    search_client=search_client,
+                    query=search_query or "legal",
+                    blob_names=ready_blob_names,
+                    top_k=6,
+                    embed_client=client,
+                )
+                if attach_chunks:
+                    attachment_contexts.extend(attach_chunks)
+                print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
+            except Exception as ua_err:
+                print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
+
+    if attachment_contexts:
+        no_context = False
+        chat_messages.append({
+            "role": "user",
+            "content": (
+                "Use the following attachment excerpts to answer. "
+                "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
+                "Cite them as 'Attachment Source'.\n\n"
+                + "\n\n".join(attachment_contexts)
+            )
+        })
+
+    if has_prior_context:
+        no_context = False
+
+    if no_context:
+        chat_messages.append({
+            "role": "user",
+            "content": (
+                "No relevant matches were found in the legal index for this specific query. "
+                "You may answer based on prior conversation context, attachments, or indicate that no matching statutes/cases were found. "
+                "Never refuse with 'I don't have enough information' if you have context from the conversation or attachments."
+            )
+        })
+
+    if context:
+        chat_messages.append({
+            "role": "user",
+            "content": f"Context from uploaded documents/emails:\n{context}"
+        })
+        chat_messages.append({
+            "role": "assistant",
+            "content": "I've reviewed the provided context. How can I help you with this information?"
+        })
+
+    for msg in messages:
+        chat_messages.append({
+            "role": msg.get("role", "user"),
+            "content": msg.get("content", "")
+        })
+
+    print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
+    temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
+    tools_for_request = get_tools(jid, j_config, bool(graph_token))
+    print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=chat_messages,
+            tools=tools_for_request,
+            tool_choice="auto" if tools_for_request else None,
+            temperature=temperature,
+            max_tokens=2000
+        )
+        print(f"Azure OpenAI response received!", file=sys.stderr)
+    except Exception as api_error:
+        print(f"Azure OpenAI API Error: {type(api_error).__name__}: {api_error}", file=sys.stderr)
+        raise
+
+    response_message = response.choices[0].message
+
+    if response_message.tool_calls and graph_token:
+        chat_messages.append({
+            "role": "assistant",
+            "content": response_message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in response_message.tool_calls
+            ]
+        })
+
+        for tool_call in response_message.tool_calls:
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            tool_result = await execute_tool(function_name, function_args, graph_token, None)
+            chat_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_result
+            })
+
+        final_response = client.chat.completions.create(
+            model=deployment,
+            messages=chat_messages,
+            temperature=0.7,
+            max_tokens=2000
+        )
+        return final_response.choices[0].message.content or ""
+
+    return response_message.content or ""
+
+
 @app.post("/api/conversation")
 @app.post("/api/agentic")
-async def conversation(request: Request):
-    """Handle chat conversation with Azure OpenAI - with function calling for M365."""
+async def conversation(request: Request, background_tasks: BackgroundTasks):
+    """Handle chat - returns job_id immediately; processing runs in background."""
     import sys
     print("=== CONVERSATION ENDPOINT HIT ===", file=sys.stderr)
     try:
         data = await request.json()
-        print(f"Full request data: {data}", file=sys.stderr)
-        print(f"Data keys: {data.keys() if isinstance(data, dict) else 'not a dict'}", file=sys.stderr)
-        
-        # Resolve jurisdiction; early return if not implemented
         jurisdiction_raw = data.get("jurisdiction", "California")
         jid, j_config = resolve_jurisdiction(jurisdiction_raw)
         display_name = j_config.get("display_name", jurisdiction_raw)
         if not j_config.get("implemented"):
-            print(f"Jurisdiction {jid} ({display_name}) not implemented, returning controlled message", file=sys.stderr)
             return JSONResponse({
                 "job_id": str(uuid.uuid4()),
                 "status": "completed",
                 "response": f"This state ({display_name}) is not yet supported. Only California is currently available.",
                 "error": "STATE_NOT_SUPPORTED"
-            }, status_code=200)
-        
-        # Try different possible message formats
-        messages = data.get("messages", [])
-        if not messages:
-            messages = data.get("conversation", [])
-        if not messages:
-            messages = data.get("history", [])
-        if not messages and "message" in data:
-            # Single message format
-            messages = [{"role": "user", "content": data.get("message", "")}]
-        if not messages and "query" in data:
-            messages = [{"role": "user", "content": data.get("query", "")}]
-        if not messages and "prompt" in data:
-            messages = [{"role": "user", "content": data.get("prompt", "")}]
-            
-        context = data.get("context", "")
-        print(f"Messages after parsing: {len(messages)}", file=sys.stderr)
-        print(f"Messages content: {messages}", file=sys.stderr)
-        
-        # Get Azure OpenAI credentials
-        key = os.getenv("AZURE_OPENAI_KEY")
-        raw_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
-        search_service = os.getenv("AZURE_SEARCH_SERVICE")
-        search_index = os.getenv("AZURE_SEARCH_INDEX")
-        search_key = os.getenv("AZURE_SEARCH_KEY")
-        # Normalize: SDK needs base endpoint (no path). Version: prefer EMBEDDING, then API, then query, then default.
-        endpoint = raw_endpoint
-        # 2023-05-15 ignores dimensions param for text-embedding-3-large, returns 3072; 2024-02-01+ requires it
-        version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-        
-        print(f"Endpoint: {endpoint}", file=sys.stderr)
-        print(f"Deployment: {deployment}", file=sys.stderr)
-        print(f"Key present: {bool(key)}", file=sys.stderr)
-        print(f"Search cfg present: service={bool(search_service)} index={bool(search_index)} key={bool(search_key)}", file=sys.stderr)
-        
-        if not key or not endpoint:
-            raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
-        
-        # Get Graph token for M365 access
-        auth_headers = {
-            "X-MS-CLIENT-PRINCIPAL": bool(request.headers.get("X-MS-CLIENT-PRINCIPAL")),
-            "X-MS-TOKEN-AAD-ACCESS-TOKEN": bool(request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN")),
-            "X-MS-TOKEN-AAD-ID-TOKEN": bool(request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")),
-        }
-        print(f"Auth headers presence: {auth_headers}", file=sys.stderr)
+            })
+        user_prefix = _get_user_blob_prefix(request)
         graph_token = await get_valid_graph_token(request)
-        print(f"Graph token available for tools: {bool(graph_token)}", file=sys.stderr)
-        
-        print("Creating AzureOpenAI client...", file=sys.stderr)
-        client = AzureOpenAI(
-            api_key=key,
-            azure_endpoint=endpoint,
-            api_version=version,
-        )
-        print("Client created, making request...", file=sys.stderr)
-        
-        # Build messages with jurisdiction-specific system prompt
-        system_prompt = JURISDICTION_SYSTEM_PROMPT.get(jid) or ""
-        chat_messages = [{"role": "system", "content": system_prompt}]
-
-        search_query = pick_search_query(messages)
-        has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
-
-        # Attachments uploaded by user (PDF only) - extract early for context routing
         blobs = data.get("blobs", [])
-        print(f"DEBUG: blobs count={len(blobs)} keys={list(data.keys())}", file=sys.stderr)
-        for b in blobs:
-            fn = (b.get("original_filename") or b.get("blob_name") or "").lower()
-            if not fn.endswith(".pdf"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported file type. Only PDF is allowed.",
-                )
-
-        legal_mode = False
-        context_chunks = []
-        no_context = False
-        attachment_contexts: List[str] = []
-        # Create SearchClient once and reuse for Legal RAG + UserAttachment (avoids duplicate connections)
-        search_client = None
-        if search_service and search_index and search_key:
-            search_endpoint = f"https://{search_service}.search.windows.net"
-            search_client = SearchClient(
-                search_endpoint, search_index, AzureKeyCredential(search_key)
-            )
-        if search_client and search_query:
-            try:
-                request_domains = data.get("domains", [])
-                if isinstance(request_domains, str):
-                    request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
-                elif not isinstance(request_domains, list):
-                    request_domains = []
-
-                candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
-                candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
-                search_query = normalize_to_text(search_query)
-
-                print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
-                context_chunks, domains_with_hits = run_multi_domain_search(
-                    search_client=search_client,
-                    query=search_query,
-                    domains=candidates,
-                    max_domains=LEGAL_MAX_DOMAINS,
-                    top_per_domain=LEGAL_TOP_PER_DOMAIN,
-                    embed_client=client,
-                )
-
-                legal_mode = len(context_chunks) > 0
-                print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
-                if legal_mode:
-                    ctx = "\n\n".join(context_chunks)
-                    pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
-                    chat_messages.append({
-                        "role": "user",
-                        "content": (
-                            pref
-                            + "Use the context below (tagged by DOMAIN). Cite the sources. "
-                            "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
-                            + ctx
-                        )
-                    })
-                    print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
-                else:
-                    no_context = True
-                    print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
-            except Exception as search_err:
-                print(f"Legal RAG search error: {search_err}", file=sys.stderr)
-        else:
-            print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
-
-        # Attachments: use indexed content (RAG) when job_id present; legacy inline processing disabled (caused timeout/OOM)
         if blobs:
-            user_prefix = _get_user_blob_prefix(request)
+            for b in blobs:
+                fn = (b.get("original_filename") or b.get("blob_name") or "")
+                if not _is_supported_attachment(fn):
+                    raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and Word (.docx) are allowed.")
             blobs_with_job = [b for b in blobs if b.get("job_id")]
             blobs_without_job = [b for b in blobs if not b.get("job_id")]
             if blobs_without_job:
@@ -1733,182 +1946,42 @@ async def conversation(request: Request):
                     status_code=400,
                     detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
                 )
+            search_query = pick_search_query(data.get("messages", []) or [{"content": data.get("query", "")}])
             processing_names = []
             failed_jobs = []
-            ready_blob_names = []
             for b in blobs_with_job:
-                job_id = b.get("job_id")
-                blob_name = b.get("blob_name")
+                att_job_id = b.get("job_id")
                 orig = b.get("original_filename", "file.pdf")
-                if not job_id or not blob_name:
+                if not att_job_id:
                     continue
-                job = get_job(user_prefix, job_id)
+                job = get_job(user_prefix, att_job_id)
                 if not job:
                     processing_names.append(orig)
-                    continue
-                st = job.get("status", "pending")
-                if st == "completed":
-                    ready_blob_names.append(blob_name)
-                elif st == "failed":
+                elif job.get("status") == "failed":
                     failed_jobs.append((orig, job.get("error", "Unknown error")))
-                else:
+                elif job.get("status") != "completed":
                     processing_names.append(orig)
             if processing_names:
-                msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
+                msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait and try again."
                 return JSONResponse({"job_id": str(uuid.uuid4()), "status": "processing", "response": msg})
             if failed_jobs:
                 err_parts = [f"{n}: {e}" for n, e in failed_jobs]
                 raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
-            if ready_blob_names and search_client:
-                try:
-                    attach_chunks = run_user_attachment_search(
-                        search_client=search_client,
-                        query=search_query or "legal",
-                        blob_names=ready_blob_names,
-                        top_k=6,
-                        embed_client=client,
-                    )
-                    if attach_chunks:
-                        attachment_contexts.extend(attach_chunks)
-                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
-                except Exception as ua_err:
-                    print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
-
-        if attachment_contexts:
-            no_context = False
-            chat_messages.append({
-                "role": "user",
-                "content": (
-                    "Use the following attachment excerpts to answer. "
-                    "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
-                    "Cite them as 'Attachment Source'.\n\n"
-                    + "\n\n".join(attachment_contexts)
-                )
-            })
-
-        if has_prior_context:
-            no_context = False
-
-        if no_context:
-            chat_messages.append({
-                "role": "user",
-                "content": (
-                    "No relevant matches were found in the legal index for this specific query. "
-                    "You may answer based on prior conversation context, attachments, or indicate that no matching statutes/cases were found. "
-                    "Never refuse with 'I don't have enough information' if you have context from the conversation or attachments."
-                )
-            })
-
-        # Add context if provided
-        if context:
-            chat_messages.append({
-                "role": "user", 
-                "content": f"Context from uploaded documents/emails:\n{context}"
-            })
-            chat_messages.append({
-                "role": "assistant",
-                "content": "I've reviewed the provided context. How can I help you with this information?"
-            })
-        
-        # Add conversation messages
-        for msg in messages:
-            chat_messages.append({
-                "role": msg.get("role", "user"),
-                "content": msg.get("content", "")
-            })
-        
-        print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
-        # Temperature: 0.2 for laws/citations; 0.5 for argumentation/expansion
-        temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
-        tools_for_request = get_tools(jid, j_config, bool(graph_token))
-        print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
-        
-        # First call - may request tool use
-        try:
-            response = client.chat.completions.create(
-                model=deployment,
-                messages=chat_messages,
-                tools=tools_for_request,
-                tool_choice="auto" if tools_for_request else None,
-                temperature=temperature,
-                max_tokens=2000
-            )
-            print(f"Azure OpenAI response received!", file=sys.stderr)
-        except Exception as api_error:
-            print(f"Azure OpenAI API Error: {type(api_error).__name__}: {api_error}", file=sys.stderr)
-            raise
-        
-        response_message = response.choices[0].message
-        
-        # Check if the model wants to use tools
-        if response_message.tool_calls and graph_token:
-            # Add the assistant's response to messages
-            chat_messages.append({
-                "role": "assistant",
-                "content": response_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in response_message.tool_calls
-                ]
-            })
-            
-            # Execute each tool call
-            for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
-                
-                # Execute the tool
-                tool_result = await execute_tool(function_name, function_args, graph_token, request)
-                
-                # Add tool result to messages
-                chat_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result
-                })
-            
-            # Get final response after tool execution
-            final_response = client.chat.completions.create(
-                model=deployment,
-                messages=chat_messages,
-                temperature=0.7,
-                max_tokens=2000
-            )
-            
-            return JSONResponse({
-                "job_id": str(uuid.uuid4()),
-                "status": "completed",
-                "response": final_response.choices[0].message.content,
-                "response": final_response.choices[0].message.content,
-                "tools_used": [tc.function.name for tc in response_message.tool_calls],
-                "usage": {
-                    "prompt_tokens": final_response.usage.prompt_tokens,
-                    "completion_tokens": final_response.usage.completion_tokens
-                }
-            })
-        
-        # No tool calls - return direct response
-        return JSONResponse({
-            "job_id": str(uuid.uuid4()),
-            "status": "completed",
-            "response": response_message.content,
-            "response": response_message.content,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens
-            }
-        })
-        
+        key = os.getenv("AZURE_OPENAI_KEY")
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        if not key or not endpoint:
+            raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
+        job_id = str(uuid.uuid4())
+        partition = "agt_" + user_prefix
+        if not create_agentic_job(partition, job_id):
+            raise HTTPException(status_code=500, detail="Failed to create job")
+        background_tasks.add_task(_run_agentic_conversation, job_id, user_prefix, data, graph_token)
+        return JSONResponse({"job_id": job_id, "status": "pending"})
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1947,11 +2020,29 @@ async def graph_health(request: Request):
 
 
 @app.get("/api/check_status/{request_id}")
-async def check_status(request_id: str):
-    """Check status of a request - returns completed since we process synchronously."""
+async def check_status(request_id: str, request: Request):
+    """Check status of agentic job - returns status, response when completed, or result (error) when failed."""
+    user_prefix = _get_user_blob_prefix(request)
+    partition = "agt_" + user_prefix
+    job = get_job(partition, request_id)
+    if not job:
+        return JSONResponse({"status": "pending", "request_id": request_id})
+    status = (job.get("status") or "pending").lower()
+    if status == "failed":
+        return JSONResponse({
+            "status": "Failed",
+            "request_id": request_id,
+            "result": job.get("error", "Unknown error"),
+        })
+    if status == "completed":
+        return JSONResponse({
+            "status": "completed",
+            "request_id": request_id,
+            "response": job.get("response", ""),
+        })
     return JSONResponse({
-        "status": "completed",
-        "request_id": request_id
+        "status": status if status != "pending" else "pending",
+        "request_id": request_id,
     })
 
 

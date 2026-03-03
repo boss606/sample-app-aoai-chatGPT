@@ -15,6 +15,21 @@ var boxCurrentFolder = '0';
 
 console.log('Joogni script loaded');
 
+/** Safely parse JSON from a fetch Response. Throws with a clear message if body is empty or invalid. */
+async function parseJsonResponse(response, context) {
+    var text = await response.text();
+    if (!text || !text.trim()) {
+        var hint = response.status === 0 ? 'Connection closed or timeout' : 'Empty response from server';
+        throw new Error(hint + (context ? ' (' + context + ')' : ''));
+    }
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        var preview = text.length > 100 ? text.substring(0, 100) + '...' : text;
+        throw new Error('Invalid response: expected JSON but received: ' + preview);
+    }
+}
+
 // --- AGREEMENT FUNCTIONS ---
 
 async function checkAgreement() {
@@ -107,6 +122,7 @@ document.addEventListener('DOMContentLoaded', function() {
     checkAgreement();
     checkBoxStatus();
     loadUserInfo();
+    updateSendButtonState();
 });
 
 // Delete uploaded blobs from storage when page unloads/reloads
@@ -898,8 +914,8 @@ async function addSelectedToChat() {
     for (var m = 0; m < files.length; m++) {
         var item = files[m];
         var ext = (item.name || '').split('.').pop().toLowerCase();
-        if (ext !== 'pdf') {
-            addMessage('File "' + (item.name || '') + '" rejected. Only PDF files are allowed.', 'system-error');
+        if (ext !== 'pdf' && ext !== 'docx') {
+            addMessage('File "' + (item.name || '') + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
             continue;
         }
         try {
@@ -907,10 +923,11 @@ async function addSelectedToChat() {
                 var response = await fetch('/api/get-upload-url', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ filename: item.name })
+                    body: JSON.stringify({ filename: item.name }),
+                    credentials: 'same-origin'
                 });
                 
-                var urlData = await response.json();
+                var urlData = await parseJsonResponse(response, 'get-upload-url');
                 if (urlData.error) throw new Error(urlData.error);
                 
                 var binaryData = atob(item.contentBytes);
@@ -933,9 +950,10 @@ async function addSelectedToChat() {
                 var regResp = await fetch('/api/register-attachment', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ blob_name: urlData.blob_name, original_filename: item.name })
+                    body: JSON.stringify({ blob_name: urlData.blob_name, original_filename: item.name }),
+                    credentials: 'same-origin'
                 });
-                var regD = await regResp.json();
+                var regD = await parseJsonResponse(regResp, 'register-attachment');
                 if (regD.error || !regD.job_id) throw new Error(regD.error || 'Attachment registration failed');
                 attachedFiles.push({
                     blob_name: urlData.blob_name,
@@ -954,17 +972,19 @@ async function addSelectedToChat() {
                     body: JSON.stringify({
                         download_url: item.downloadUrl,
                         file_name: item.name
-                    })
+                    }),
+                    credentials: 'same-origin'
                 });
                 
-                var data = await response2.json();
+                var data = await parseJsonResponse(response2, 'download-graph-file');
                 if (data.error) throw new Error(data.error);
                 var regOd = await fetch('/api/register-attachment', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ blob_name: data.blob_name, original_filename: data.original_filename })
+                    body: JSON.stringify({ blob_name: data.blob_name, original_filename: data.original_filename }),
+                    credentials: 'same-origin'
                 });
-                var regOdData = await regOd.json();
+                var regOdData = await parseJsonResponse(regOd, 'register-attachment');
                 if (regOdData.error || !regOdData.job_id) throw new Error(regOdData.error || 'Attachment registration failed');
                 attachedFiles.push({
                     blob_name: data.blob_name,
@@ -979,6 +999,7 @@ async function addSelectedToChat() {
             }
         } catch (error) {
             console.error('Failed to import ' + item.name + ':', error);
+            addMessage('Failed to import "' + (item.name || '') + '": ' + error.message, 'system-error');
         }
     }
     
@@ -986,8 +1007,8 @@ async function addSelectedToChat() {
     for (var b = 0; b < boxFiles.length; b++) {
         var boxFile = boxFiles[b];
         var boxExt = (boxFile.name || '').split('.').pop().toLowerCase();
-        if (boxExt !== 'pdf') {
-            addMessage('File "' + (boxFile.name || '') + '" rejected. Only PDF files are allowed.', 'system-error');
+        if (boxExt !== 'pdf' && boxExt !== 'docx') {
+            addMessage('File "' + (boxFile.name || '') + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
             continue;
         }
         try {
@@ -997,17 +1018,19 @@ async function addSelectedToChat() {
                 body: JSON.stringify({
                     file_id: boxFile.id,
                     file_name: boxFile.name
-                })
+                }),
+                credentials: 'same-origin'
             });
             
-            var boxData = await boxResponse.json();
+            var boxData = await parseJsonResponse(boxResponse, 'box/download');
             if (boxData.error) throw new Error(boxData.error);
             var regBox = await fetch('/api/register-attachment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ blob_name: boxData.blob_name, original_filename: boxData.original_filename })
+                body: JSON.stringify({ blob_name: boxData.blob_name, original_filename: boxData.original_filename }),
+                credentials: 'same-origin'
             });
-            var regBoxData = await regBox.json();
+            var regBoxData = await parseJsonResponse(regBox, 'register-attachment');
             if (regBoxData.error || !regBoxData.job_id) throw new Error(regBoxData.error || 'Attachment registration failed');
             attachedFiles.push({
                 blob_name: boxData.blob_name,
@@ -1021,6 +1044,7 @@ async function addSelectedToChat() {
             }
         } catch (error) {
             console.error('Failed to import Box file ' + boxFile.name + ':', error);
+            addMessage('Failed to import Box file "' + (boxFile.name || '') + '": ' + error.message, 'system-error');
         }
     }
     
@@ -1050,8 +1074,8 @@ async function handleFileSelect(event) {
     for (var i = 0; i < files.length; i++) {
         var file = files[i];
         var ext = (file.name || '').split('.').pop().toLowerCase();
-        if (ext !== 'pdf') {
-            addMessage('File "' + file.name + '" rejected. Only PDF files are allowed.', 'system-error');
+        if (ext !== 'pdf' && ext !== 'docx') {
+            addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
             continue;
         }
         if (file.size > 50 * 1024 * 1024) {
@@ -1065,10 +1089,11 @@ async function handleFileSelect(event) {
             var urlResponse = await fetch('/api/get-upload-url', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: file.name })
+                body: JSON.stringify({ filename: file.name }),
+                credentials: 'same-origin'
             });
 
-            var urlData = await urlResponse.json();
+            var urlData = await parseJsonResponse(urlResponse, 'get-upload-url');
             if (urlData.error) throw new Error(urlData.error);
 
             var uploadResponse = await fetch(urlData.upload_url, {
@@ -1088,12 +1113,15 @@ async function handleFileSelect(event) {
                 body: JSON.stringify({
                     blob_name: urlData.blob_name,
                     original_filename: file.name
-                })
+                }),
+                credentials: 'same-origin'
             });
-            var regData = await regResponse.json().catch(function() { return {}; });
+            var regData = await parseJsonResponse(regResponse, 'register-attachment').catch(function(e) {
+                return { error: e.message };
+            });
             if (!regResponse.ok || !regData.job_id) {
                 removeMessage(statusId);
-                addMessage('File uploaded but background processing failed. Please try again.', 'system-error');
+                addMessage(regData.error || 'File uploaded but background processing failed. Please try again.', 'system-error');
                 return;
             }
             var jobId = regData.job_id;
@@ -1153,6 +1181,26 @@ function startAttachmentJobPolling(jobId) {
     }, interval);
 }
 
+function hasProcessingAttachments() {
+    return attachedFiles.some(function(f) {
+        var s = (f.status || '').toLowerCase();
+        return s === 'pending' || s === 'processing';
+    });
+}
+
+function updateSendButtonState() {
+    var btn = document.getElementById('btn-send');
+    var warning = document.getElementById('processing-warning');
+    var processing = hasProcessingAttachments();
+    if (btn) {
+        btn.disabled = processing;
+        btn.title = processing ? 'Wait for documents to finish processing before sending' : 'Send message';
+    }
+    if (warning) {
+        warning.classList.toggle('hidden', !processing);
+    }
+}
+
 function updateAttachmentsUI() {
     var preview = document.getElementById('attachments-preview');
     var list = document.getElementById('attachments-list');
@@ -1165,12 +1213,14 @@ function updateAttachmentsUI() {
     if (totalItems === 0) {
         preview.classList.add('hidden');
         count.classList.add('hidden');
+        updateSendButtonState();
         return;
     }
 
     preview.classList.remove('hidden');
     count.classList.remove('hidden');
     count.textContent = totalItems;
+    updateSendButtonState();
 
     var html = '';
     
@@ -1291,6 +1341,11 @@ function startNewConversation() {
 async function sendMessage() {
     var input = document.getElementById('user-input');
     if (!input) return;
+
+    if (hasProcessingAttachments()) {
+        addMessage('Please wait for documents to finish processing before sending.', 'system-error');
+        return;
+    }
     
     var message = input.value.trim();
     
@@ -1334,10 +1389,11 @@ async function sendMessage() {
                 blobs: attachedFiles,
                 emails: selectedEmails,
                 calendar_events: selectedCalendarEvents
-            })
+            }),
+            credentials: 'same-origin'
         });
 
-        var data = await response.json();
+        var data = await parseJsonResponse(response, 'chat');
 
         if (data.error) {
             removeMessage(statusId);
@@ -1352,8 +1408,9 @@ async function sendMessage() {
         removeMessage(statusId);
 
         if (result.status === 'completed') {
-            addMessage(data.response, 'system', true);
-            messageHistory.push({ role: 'assistant', content: data.response || '' });
+            var responseText = (result.response || data.response) || '';
+            addMessage(responseText, 'system', true);
+            messageHistory.push({ role: 'assistant', content: responseText });
         } else if (result.status === 'Failed') {
             addMessage('Error: ' + result.result, 'system-error');
             messageHistory.pop();
@@ -1434,8 +1491,8 @@ async function pollForResultWithStatus(jobId, statusId, maxAttempts, interval) {
     
     for (var i = 0; i < maxAttempts; i++) {
         try {
-            var response = await fetch('/api/check_status/' + jobId);
-            var data = await response.json();
+            var response = await fetch('/api/check_status/' + jobId, { credentials: 'same-origin' });
+            var data = await parseJsonResponse(response, 'status poll');
             
             // Update status display
             if (data.status && data.status !== 'completed' && data.status !== 'Failed') {
@@ -1461,8 +1518,8 @@ async function pollForResult(jobId, maxAttempts, interval) {
     
     for (var i = 0; i < maxAttempts; i++) {
         try {
-            var response = await fetch('/api/check_status/' + jobId);
-            var data = await response.json();
+            var response = await fetch('/api/check_status/' + jobId, { credentials: 'same-origin' });
+            var data = await parseJsonResponse(response, 'status poll');
             
             if (data.status === 'completed' || data.status === 'Failed') {
                 return data;
