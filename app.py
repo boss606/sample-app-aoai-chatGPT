@@ -141,6 +141,8 @@ Format responses with clear structure when appropriate. Be thorough but concise.
     "co": None,
 }
 
+FREE_CHAT_SYSTEM_PROMPT = """You are a helpful AI assistant. Answer questions clearly and concisely. Be conversational and helpful."""
+
 # Config per jurisdiction: implemented, domains for legal search, M365 tools enabled
 JURISDICTION_CONFIG = {
     "ca": {
@@ -1691,172 +1693,186 @@ async def _execute_agentic_logic(
     )
     print("Client created, making request...", file=sys.stderr)
 
-    system_prompt = JURISDICTION_SYSTEM_PROMPT.get(jid) or ""
-    chat_messages = [{"role": "system", "content": system_prompt}]
-
-    search_query = pick_search_query(messages)
-    has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
-
-    blobs = data.get("blobs", [])
-    print(f"DEBUG: blobs count={len(blobs)} keys={list(data.keys())}", file=sys.stderr)
-    for b in blobs:
-        fn = (b.get("original_filename") or b.get("blob_name") or "")
-        if not _is_supported_attachment(fn):
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type. Only PDF and Word (.docx) are allowed.",
-            )
-
-    legal_mode = False
-    context_chunks = []
-    no_context = False
-    attachment_contexts: List[str] = []
-    search_client = None
-    if search_service and search_index and search_key:
-        search_endpoint = f"https://{search_service}.search.windows.net"
-        search_client = SearchClient(
-            search_endpoint, search_index, AzureKeyCredential(search_key)
-        )
-    if search_client and search_query:
-        try:
-            request_domains = data.get("domains", [])
-            if isinstance(request_domains, str):
-                request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
-            elif not isinstance(request_domains, list):
-                request_domains = []
-
-            candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
-            candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
-            search_query = normalize_to_text(search_query)
-
-            print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
-            context_chunks, domains_with_hits = run_multi_domain_search(
-                search_client=search_client,
-                query=search_query,
-                domains=candidates,
-                max_domains=LEGAL_MAX_DOMAINS,
-                top_per_domain=LEGAL_TOP_PER_DOMAIN,
-                embed_client=client,
-            )
-
-            legal_mode = len(context_chunks) > 0
-            print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
-            if legal_mode:
-                ctx = "\n\n".join(context_chunks)
-                pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
-                chat_messages.append({
-                    "role": "user",
-                    "content": (
-                        pref
-                        + "Use the context below (tagged by DOMAIN). Cite the sources. "
-                        "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
-                        + ctx
-                    )
-                })
-                print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
-            else:
-                no_context = True
-                print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
-        except Exception as search_err:
-            print(f"Legal RAG search error: {search_err}", file=sys.stderr)
+    free_mode = data.get("free_mode")
+    if free_mode:
+        system_prompt = FREE_CHAT_SYSTEM_PROMPT
+        chat_messages = [{"role": "system", "content": system_prompt}]
+        for msg in messages:
+            chat_messages.append({
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", "")
+            })
+        tools_for_request = None
+        temperature = 0.5
+        legal_mode = False
+        print("Free mode: using generic prompt, no RAG, no tools", file=sys.stderr)
     else:
-        print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
+        system_prompt = JURISDICTION_SYSTEM_PROMPT.get(jid) or ""
+        chat_messages = [{"role": "system", "content": system_prompt}]
 
-    if blobs:
-        blobs_with_job = [b for b in blobs if b.get("job_id")]
-        blobs_without_job = [b for b in blobs if not b.get("job_id")]
-        if blobs_without_job:
-            names = [b.get("original_filename", "file") for b in blobs_without_job]
-            raise HTTPException(
-                status_code=400,
-                detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
+        search_query = pick_search_query(messages)
+        has_prior_context = any(m.get("role") == "assistant" for m in messages) or bool(data.get("context"))
+
+        blobs = data.get("blobs", [])
+        print(f"DEBUG: blobs count={len(blobs)} keys={list(data.keys())}", file=sys.stderr)
+        for b in blobs:
+            fn = (b.get("original_filename") or b.get("blob_name") or "")
+            if not _is_supported_attachment(fn):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file type. Only PDF and Word (.docx) are allowed.",
+                )
+
+        legal_mode = False
+        context_chunks = []
+        no_context = False
+        attachment_contexts: List[str] = []
+        search_client = None
+        if search_service and search_index and search_key:
+            search_endpoint = f"https://{search_service}.search.windows.net"
+            search_client = SearchClient(
+                search_endpoint, search_index, AzureKeyCredential(search_key)
             )
-        processing_names = []
-        failed_jobs = []
-        ready_blob_names = []
-        for b in blobs_with_job:
-            att_job_id = b.get("job_id")
-            blob_name = b.get("blob_name")
-            orig = b.get("original_filename", "file.pdf")
-            if not att_job_id or not blob_name:
-                continue
-            job = get_job(user_prefix, att_job_id)
-            if not job:
-                processing_names.append(orig)
-                continue
-            st = job.get("status", "pending")
-            if st == "completed":
-                ready_blob_names.append(blob_name)
-            elif st == "failed":
-                failed_jobs.append((orig, job.get("error", "Unknown error")))
-            else:
-                processing_names.append(orig)
-        if processing_names:
-            msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
-            raise HTTPException(status_code=400, detail=msg)
-        if failed_jobs:
-            err_parts = [f"{n}: {e}" for n, e in failed_jobs]
-            raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
-        if ready_blob_names and search_client:
+        if search_client and search_query:
             try:
-                attach_chunks = run_user_attachment_search(
+                request_domains = data.get("domains", [])
+                if isinstance(request_domains, str):
+                    request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
+                elif not isinstance(request_domains, list):
+                    request_domains = []
+
+                candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
+                candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
+                search_query = normalize_to_text(search_query)
+
+                print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
+                context_chunks, domains_with_hits = run_multi_domain_search(
                     search_client=search_client,
-                    query=search_query or "legal",
-                    blob_names=ready_blob_names,
-                    top_k=6,
+                    query=search_query,
+                    domains=candidates,
+                    max_domains=LEGAL_MAX_DOMAINS,
+                    top_per_domain=LEGAL_TOP_PER_DOMAIN,
                     embed_client=client,
                 )
-                if attach_chunks:
-                    attachment_contexts.extend(attach_chunks)
-                print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
-            except Exception as ua_err:
-                print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
 
-    if attachment_contexts:
-        no_context = False
-        chat_messages.append({
-            "role": "user",
-            "content": (
-                "Use the following attachment excerpts to answer. "
-                "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
-                "Cite them as 'Attachment Source'.\n\n"
-                + "\n\n".join(attachment_contexts)
-            )
-        })
+                legal_mode = len(context_chunks) > 0
+                print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
+                if legal_mode:
+                    ctx = "\n\n".join(context_chunks)
+                    pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
+                    chat_messages.append({
+                        "role": "user",
+                        "content": (
+                            pref
+                            + "Use the context below (tagged by DOMAIN). Cite the sources. "
+                            "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
+                            + ctx
+                        )
+                    })
+                    print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
+                else:
+                    no_context = True
+                    print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
+            except Exception as search_err:
+                print(f"Legal RAG search error: {search_err}", file=sys.stderr)
+        else:
+            print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
 
-    if has_prior_context:
-        no_context = False
+        if blobs:
+            blobs_with_job = [b for b in blobs if b.get("job_id")]
+            blobs_without_job = [b for b in blobs if not b.get("job_id")]
+            if blobs_without_job:
+                names = [b.get("original_filename", "file") for b in blobs_without_job]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
+                )
+            processing_names = []
+            failed_jobs = []
+            ready_blob_names = []
+            for b in blobs_with_job:
+                att_job_id = b.get("job_id")
+                blob_name = b.get("blob_name")
+                orig = b.get("original_filename", "file.pdf")
+                if not att_job_id or not blob_name:
+                    continue
+                job = get_job(user_prefix, att_job_id)
+                if not job:
+                    processing_names.append(orig)
+                    continue
+                st = job.get("status", "pending")
+                if st == "completed":
+                    ready_blob_names.append(blob_name)
+                elif st == "failed":
+                    failed_jobs.append((orig, job.get("error", "Unknown error")))
+                else:
+                    processing_names.append(orig)
+            if processing_names:
+                msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
+                raise HTTPException(status_code=400, detail=msg)
+            if failed_jobs:
+                err_parts = [f"{n}: {e}" for n, e in failed_jobs]
+                raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
+            if ready_blob_names and search_client:
+                try:
+                    attach_chunks = run_user_attachment_search(
+                        search_client=search_client,
+                        query=search_query or "legal",
+                        blob_names=ready_blob_names,
+                        top_k=6,
+                        embed_client=client,
+                    )
+                    if attach_chunks:
+                        attachment_contexts.extend(attach_chunks)
+                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
+                except Exception as ua_err:
+                    print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
 
-    if no_context:
-        chat_messages.append({
-            "role": "user",
-            "content": (
-                "No relevant matches were found in the legal index for this specific query. "
-                "You may answer based on prior conversation context, attachments, or indicate that no matching statutes/cases were found. "
-                "Never refuse with 'I don't have enough information' if you have context from the conversation or attachments."
-            )
-        })
+        if attachment_contexts:
+            no_context = False
+            chat_messages.append({
+                "role": "user",
+                "content": (
+                    "Use the following attachment excerpts to answer. "
+                    "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
+                    "Cite them as 'Attachment Source'.\n\n"
+                    + "\n\n".join(attachment_contexts)
+                )
+            })
 
-    if context:
-        chat_messages.append({
-            "role": "user",
-            "content": f"Context from uploaded documents/emails:\n{context}"
-        })
-        chat_messages.append({
-            "role": "assistant",
-            "content": "I've reviewed the provided context. How can I help you with this information?"
-        })
+        if has_prior_context:
+            no_context = False
 
-    for msg in messages:
-        chat_messages.append({
-            "role": msg.get("role", "user"),
-            "content": msg.get("content", "")
-        })
+        if no_context:
+            chat_messages.append({
+                "role": "user",
+                "content": (
+                    "No relevant matches were found in the legal index for this specific query. "
+                    "You may answer based on prior conversation context, attachments, or indicate that no matching statutes/cases were found. "
+                    "Never refuse with 'I don't have enough information' if you have context from the conversation or attachments."
+                )
+            })
 
-    print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
-    temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
-    tools_for_request = get_tools(jid, j_config, bool(graph_token))
-    print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
+        if context:
+            chat_messages.append({
+                "role": "user",
+                "content": f"Context from uploaded documents/emails:\n{context}"
+            })
+            chat_messages.append({
+                "role": "assistant",
+                "content": "I've reviewed the provided context. How can I help you with this information?"
+            })
+
+        for msg in messages:
+            chat_messages.append({
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", "")
+            })
+
+        print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
+        temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
+        tools_for_request = get_tools(jid, j_config, bool(graph_token))
+        print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
 
     try:
         response = client.chat.completions.create(

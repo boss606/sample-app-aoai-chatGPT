@@ -807,6 +807,15 @@
             font-size: 13px; color: var(--primary-700);
         }
         .processing-warning.hidden { display: none; }
+        .chat-mode-row { max-width: 800px; margin: 0 auto 8px; }
+        .chat-mode-toggle {
+            display: inline-flex; align-items: center; gap: 8px;
+            font-size: 13px; color: var(--gray-600);
+            cursor: pointer; user-select: none;
+        }
+        .chat-mode-toggle input { margin: 0; cursor: pointer; }
+        .chat-mode-toggle:hover { color: var(--gray-800); }
+        .chat-mode-toggle span { display: flex; align-items: center; gap: 6px; }
         .input-wrapper { max-width: 800px; margin: 0 auto; display: flex; gap: 12px; align-items: flex-end; }
         
         .btn-attach {
@@ -1104,6 +1113,12 @@
             <i class="fas fa-info-circle"></i>
             <span>Wait for documents to finish processing before sending.</span>
         </div>
+        <div class="chat-mode-row">
+            <label class="chat-mode-toggle" title="Modo livre sem RAG (tipo ChatGPT)">
+                <input type="checkbox" id="free-mode-toggle">
+                <span><i class="fas fa-comments"></i> Free Chat</span>
+            </label>
+        </div>
         <div class="input-wrapper">
             <input type="file" id="file-input" style="display: none;" multiple accept=".pdf,application/pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onchange="handleFileSelect(event)">
             <button onclick="document.getElementById('file-input').click()" class="btn-attach" title="Attach Files">
@@ -1118,6 +1133,6 @@
         </div>
     </footer>
 
-    <script src="/static/script.js?v=4"></script>
+    <script src="/static/script.js?v=5"></script>
 </body>
 </html>

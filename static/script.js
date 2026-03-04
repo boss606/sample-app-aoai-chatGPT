@@ -1375,6 +1375,15 @@ async function sendMessage() {
     var jurisdictionSelect = document.getElementById('jurisdiction');
     var jurisdiction = jurisdictionSelect ? jurisdictionSelect.value : 'California';
 
+    // Free mode: no RAG, no tools (ChatGPT-like)
+    var freeMode = document.getElementById('free-mode-toggle') ? document.getElementById('free-mode-toggle').checked : false;
+    var blobsToSend = freeMode ? [] : attachedFiles;
+    var emailsToSend = freeMode ? [] : selectedEmails;
+    var calendarToSend = freeMode ? [] : selectedCalendarEvents;
+    if (freeMode && (attachedFiles.length > 0 || selectedEmails.length > 0 || selectedCalendarEvents.length > 0)) {
+        addMessage('Modo Free: anexos não são utilizados nesta mensagem.', 'system');
+    }
+
     // Add agentic status indicator
     var statusId = addAgenticStatus();
 
@@ -1386,9 +1395,10 @@ async function sendMessage() {
                 query: userContent,
                 jurisdiction: jurisdiction,
                 messages: messageHistory,
-                blobs: attachedFiles,
-                emails: selectedEmails,
-                calendar_events: selectedCalendarEvents
+                blobs: blobsToSend,
+                emails: emailsToSend,
+                calendar_events: calendarToSend,
+                free_mode: freeMode
             }),
             credentials: 'same-origin'
         });
