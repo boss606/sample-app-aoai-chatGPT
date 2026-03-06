@@ -129,6 +129,13 @@ For email/calendar context:
 
 Always maintain attorney-client privilege awareness and remind users not to share client-identifying information outside secure channels.
 
+FORMATTING: Structure all responses for readability:
+- Use markdown headings (# for main, ## for sections, ### for subsections)
+- Use bullet lists (- or *) for unordered items
+- Use numbered lists (1. 2. 3.) for sequential steps
+- Add blank lines between sections; avoid dense text walls
+- Keep paragraphs short (2-4 sentences max)
+
 Format responses with clear structure when appropriate. Be thorough but concise.""",
     "ny": None,
     "tx": None,
@@ -141,7 +148,14 @@ Format responses with clear structure when appropriate. Be thorough but concise.
     "co": None,
 }
 
-FREE_CHAT_SYSTEM_PROMPT = """You are a helpful AI assistant. Answer questions clearly and concisely. Be conversational and helpful."""
+FREE_CHAT_SYSTEM_PROMPT = """You are a helpful AI assistant. Answer questions clearly and concisely. Be conversational and helpful.
+
+FORMATTING: Structure all responses for readability:
+- Use markdown headings (# for main, ## for sections, ### for subsections)
+- Use bullet lists (- or *) for unordered items
+- Use numbered lists (1. 2. 3.) for sequential steps
+- Add blank lines between sections; avoid dense text walls
+- Keep paragraphs short (2-4 sentences max)"""
 
 # Config per jurisdiction: implemented, domains for legal search, M365 tools enabled
 JURISDICTION_CONFIG = {

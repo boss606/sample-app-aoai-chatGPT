@@ -389,7 +389,7 @@
         
         .message-bubble {
             padding: 16px 20px; border-radius: 16px;
-            font-size: 14px; line-height: 1.65; max-width: 100%;
+            font-size: 14px; line-height: 1.5; max-width: 100%;
         }
         
         .message-system .message-bubble {
@@ -411,16 +411,19 @@
             background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
         }
         
-        /* Prose */
-        .prose-chat h1, .prose-chat h2, .prose-chat h3 { font-weight: 600; color: var(--gray-900); margin-top: 1.25em; margin-bottom: 0.5em; }
+        /* Prose - typography and spacing system */
+        .prose-chat > *:first-child { margin-top: 0; }
+        .prose-chat > *:last-child { margin-bottom: 0; }
+        .prose-chat h1, .prose-chat h2, .prose-chat h3 { font-weight: 600; color: var(--gray-900); margin-top: 20px; margin-bottom: 10px; }
+        .prose-chat h1:first-child, .prose-chat h2:first-child, .prose-chat h3:first-child { margin-top: 0; }
         .prose-chat h1 { font-size: 1.25rem; }
         .prose-chat h2 { font-size: 1.125rem; }
         .prose-chat h3 { font-size: 1rem; }
-        .prose-chat p { margin-bottom: 0.875em; }
-        .prose-chat ul, .prose-chat ol { margin-left: 1.5em; margin-bottom: 0.875em; }
+        .prose-chat p { line-height: 1.5; margin-bottom: 10px; }
+        .prose-chat ul, .prose-chat ol { margin: 10px 0; margin-left: 1.5em; }
         .prose-chat ul { list-style-type: disc; }
         .prose-chat ol { list-style-type: decimal; }
-        .prose-chat li { margin-bottom: 0.375em; }
+        .prose-chat li { margin-bottom: 5px; }
         .prose-chat strong { font-weight: 600; color: var(--gray-900); }
         .prose-chat code { background: var(--gray-100); padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
         .prose-chat pre { background: var(--gray-800); color: var(--gray-100); padding: 16px; border-radius: 10px; overflow-x: auto; margin: 1em 0; }

@@ -1596,7 +1596,16 @@ function renderMarkdown(text) {
     // Blockquotes
     html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
     
-    // Lists
+    // Numbered lists (process before bullet lists)
+    html = html.replace(/((?:^[\s]*\d+[.)]\s+.+$\n?)+)/gm, function(match) {
+        var items = match.trim().split(/\n/).map(function(line) {
+            var m = line.match(/^[\s]*\d+[.)]\s+(.+)$/);
+            return m ? '<li>' + m[1] + '</li>' : '';
+        }).filter(Boolean);
+        return items.length ? '<ol>' + items.join('') + '</ol>' : match;
+    });
+    
+    // Bullet lists
     html = html.replace(/^[\s]*[-*] (.+)$/gm, '<li>$1</li>');
     html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
     
@@ -1607,7 +1616,7 @@ function renderMarkdown(text) {
     html = html.replace(/\n\n+/g, '</p><p>');
     html = html.replace(/\n/g, '<br>');
     
-    if (!html.startsWith('<h') && !html.startsWith('<ul') && !html.startsWith('<pre') && !html.startsWith('<blockquote')) {
+    if (!html.startsWith('<h') && !html.startsWith('<ul') && !html.startsWith('<ol') && !html.startsWith('<pre') && !html.startsWith('<blockquote')) {
         html = '<p>' + html + '</p>';
     }
     
