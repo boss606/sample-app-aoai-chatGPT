@@ -58,6 +58,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Restore Oryx defaults (fix app broken by previous deploy)
+        run: |
+          az webapp config appsettings set --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true --output none
+          az webapp config set --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --generic-configurations '{"appCommandLine":""}' --output none
+
+      - name: Wait for SCM after config change
+        run: sleep 60
+
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
