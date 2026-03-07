@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from openai import AzureOpenAI
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -62,7 +62,7 @@ async def add_no_cache_headers(request: Request, call_next):
     """Prevent caching of static assets and chat page to ensure deployments are visible."""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/static/") or path == "/chat" or path == "/chat-script.js":
+    if path.startswith("/static/") or path == "/chat":
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -83,40 +83,6 @@ if os.path.isdir("/home/site/wwwroot/templates"):
 elif os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")):
     templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 templates = Jinja2Templates(directory=templates_dir)
-
-# Cache script.js in memory at startup. Refreshed on each deploy (app restart).
-_chat_script_cache: Optional[str] = None
-
-
-def _get_chat_script() -> Optional[str]:
-    """Load script.js once at startup; cached in memory. No disk I/O per request."""
-    global _chat_script_cache
-    if _chat_script_cache is None:
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "script.js")
-        if os.path.isfile(script_path):
-            with open(script_path, "r", encoding="utf-8") as f:
-                _chat_script_cache = f.read()
-        else:
-            _chat_script_cache = ""  # Signal not found
-    return _chat_script_cache if _chat_script_cache else None
-
-
-@app.get("/chat-script.js")
-async def serve_chat_script():
-    """Serve script.js from memory cache. Loaded once at startup, fresh after each deploy."""
-    content = _get_chat_script()
-    if content is None or content == "":
-        raise HTTPException(status_code=404, detail="script.js not found")
-    return Response(
-        content=content,
-        media_type="application/javascript",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
-
 
 # ============== Multi-Jurisdiction Registry ==============
 # Display name (from dropdown) -> internal jurisdiction id
