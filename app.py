@@ -57,12 +57,15 @@ load_dotenv(override=False)
 app = FastAPI(title="Joogni", description="Multi-jurisdiction Legal AI Assistant")
 
 
+# Paths that serve HTML - never cache so deployments are visible immediately
+NO_CACHE_PATHS = {"/", "/login", "/dashboard", "/chat", "/calculators"}
+
 @app.middleware("http")
 async def add_no_cache_headers(request: Request, call_next):
-    """Prevent caching of static assets and chat page to ensure deployments are visible."""
+    """Prevent caching of static assets and HTML pages to ensure deployments are visible."""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/static/") or path == "/chat":
+    if path.startswith("/static/") or path in NO_CACHE_PATHS or path == "/api/version":
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -1399,14 +1402,7 @@ async def chat_page(request: Request):
             content='<script>window.location.href="/.auth/login/aad?post_login_redirect_uri=/chat";</script>',
             status_code=200
         )
-    deploy_sha = "not-deployed"
-    try:
-        sha_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DEPLOY_SHA.txt")
-        if os.path.isfile(sha_path):
-            with open(sha_path) as f:
-                deploy_sha = f.read().strip()[:12]
-    except Exception:
-        pass
+    deploy_sha = _get_deploy_sha()
     return templates.TemplateResponse("index.html", {
         "request": request,
         "deploy_sha": deploy_sha,
@@ -1430,18 +1426,34 @@ async def calculators_page(request: Request):
 user_agreements = {}
 
 
+def _get_deploy_sha() -> str:
+    """Read deploy SHA from DEPLOY_SHA.txt for cache busting and verification."""
+    try:
+        sha_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DEPLOY_SHA.txt")
+        if os.path.isfile(sha_path):
+            with open(sha_path) as f:
+                return f.read().strip()[:12]
+    except Exception:
+        pass
+    return "not-deployed"
+
+
 @app.get("/api/version")
 async def api_version():
-    """Deploy verification: returns version info. No auth required."""
+    """Deploy verification: returns version info and deploy SHA. No auth required."""
+    deploy_sha = _get_deploy_sha()
     version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "version.json")
     if os.path.isfile(version_file):
         try:
             with open(version_file) as f:
-                return JSONResponse(json.load(f))
+                data = json.load(f)
+                data["deploy_sha"] = deploy_sha
+                return JSONResponse(data)
         except Exception:
             pass
     return JSONResponse({
         "deploy_check": "typography-v1",
+        "deploy_sha": deploy_sha,
         "message": "If you see this, app.py was deployed. static/version.json not found.",
     })
 

@@ -29,6 +29,23 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
+      - name: Bust Oryx build cache (force fresh deploy - Oryx caches by requirements.txt hash)
+        run: |
+          echo "# deploy=${{ github.sha }}" >> requirements.txt
+
+      - name: Verify package contents before upload
+        run: |
+          echo "=== Files in deployment package ==="
+          ls -la
+          echo "=== DEPLOY_SHA.txt content ==="
+          cat DEPLOY_SHA.txt
+          echo "=== app.py has _get_deploy_sha? ==="
+          grep -c "_get_deploy_sha" app.py || true
+          echo "=== templates/index.html exists? ==="
+          ls -la templates/index.html
+          echo "=== static/script.js exists? ==="
+          ls -la static/script.js
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -49,6 +66,14 @@ jobs:
         with:
           name: python-app
 
+      - name: Verify artifact before deploy
+        run: |
+          echo "=== Artifact contents ==="
+          ls -la
+          echo "=== DEPLOY_SHA.txt ==="
+          cat DEPLOY_SHA.txt 2>/dev/null || echo "NOT FOUND"
+          echo "=== Target: Joogni-West, slot: Production ==="
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -60,3 +85,9 @@ jobs:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
+
+      - name: Restart Web App
+        run: |
+          RG=$(az webapp show --name Joogni-West --query resourceGroup -o tsv)
+          echo "Restarting Joogni-West in resource group: $RG"
+          az webapp restart --name Joogni-West --resource-group $RG
