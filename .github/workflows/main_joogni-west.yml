@@ -33,26 +33,13 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Verify package contents before upload
-        run: |
-          echo "=== Files in deployment package ==="
-          ls -la
-          echo "=== DEPLOY_SHA.txt content ==="
-          cat DEPLOY_SHA.txt
-          echo "=== app.py has _get_deploy_sha? ==="
-          grep -c "_get_deploy_sha" app.py || true
-          echo "=== templates/index.html exists? ==="
-          ls -la templates/index.html
-          echo "=== static/script.js exists? ==="
-          ls -la static/script.js
-
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: |
             .
-            !.git
+            !antenv/
 
   deploy:
     runs-on: ubuntu-latest
@@ -66,26 +53,10 @@ jobs:
         with:
           name: python-app
 
-      - name: Verify artifact before deploy
-        run: |
-          echo "=== Artifact contents ==="
-          ls -la
-          echo "=== DEPLOY_SHA.txt ==="
-          cat DEPLOY_SHA.txt 2>/dev/null || echo "NOT FOUND"
-          echo "=== Target: Joogni-West, slot: Production ==="
-
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Disable Oryx (deploy our exact files, no build cache)
-        run: |
-          az webapp config appsettings set --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false --output none
-
-      - name: Set startup command (use venv gunicorn)
-        run: |
-          az webapp config set --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --startup-file "antenv/bin/gunicorn --bind=0.0.0.0:8000 --workers=2 -k uvicorn.workers.UvicornWorker app:app" --output none
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
