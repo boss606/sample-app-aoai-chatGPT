@@ -811,15 +811,6 @@
             font-size: 13px; color: var(--primary-700);
         }
         .processing-warning.hidden { display: none; }
-        .chat-mode-row { max-width: 800px; margin: 0 auto 8px; }
-        .chat-mode-toggle {
-            display: inline-flex; align-items: center; gap: 8px;
-            font-size: 13px; color: var(--gray-600);
-            cursor: pointer; user-select: none;
-        }
-        .chat-mode-toggle input { margin: 0; cursor: pointer; }
-        .chat-mode-toggle:hover { color: var(--gray-800); }
-        .chat-mode-toggle span { display: flex; align-items: center; gap: 6px; }
         .input-wrapper { max-width: 800px; margin: 0 auto; display: flex; gap: 12px; align-items: flex-end; }
         
         .btn-attach {
@@ -860,6 +851,20 @@
         .btn-m365:hover { background: var(--gray-100); border-color: var(--gray-300); color: var(--gray-600); }
         .btn-m365.active { background: var(--primary-50); border-color: var(--primary-400); color: var(--primary-600); }
         .btn-m365 i { font-size: 18px; }
+        
+        .btn-free-chat {
+            display: flex; align-items: center; justify-content: center;
+            width: 48px; height: 48px;
+            background: var(--gray-50);
+            border: 1.5px solid var(--gray-200);
+            border-radius: 12px;
+            color: var(--gray-500);
+            cursor: pointer; transition: all 0.15s ease;
+        }
+        .btn-free-chat:hover { background: var(--gray-100); border-color: var(--gray-300); color: var(--gray-600); }
+        .btn-free-chat:has(input:checked) { background: var(--primary-50); border-color: var(--primary-400); color: var(--primary-600); }
+        .btn-free-chat i { font-size: 18px; }
+        .btn-free-chat input { display: none; }
         
         .input-field {
             flex: 1; padding: 14px 18px;
@@ -1117,18 +1122,16 @@
             <i class="fas fa-info-circle"></i>
             <span>Wait for documents to finish processing before sending.</span>
         </div>
-        <div class="chat-mode-row">
-            <label class="chat-mode-toggle" title="Modo livre sem RAG (tipo ChatGPT)">
-                <input type="checkbox" id="free-mode-toggle">
-                <span><i class="fas fa-comments"></i> Free Chat</span>
-            </label>
-        </div>
         <div class="input-wrapper">
             <input type="file" id="file-input" style="display: none;" multiple accept=".pdf,application/pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onchange="handleFileSelect(event)">
             <button onclick="document.getElementById('file-input').click()" class="btn-attach" title="Attach Files">
                 <i class="fas fa-paperclip"></i>
                 <span id="attachment-count" class="attachment-badge hidden">0</span>
             </button>
+            <label class="btn-free-chat" title="Free Chat (no RAG, ChatGPT)">
+                <input type="checkbox" id="free-mode-toggle" style="display: none">
+                <i class="fas fa-comments"></i>
+            </label>
             <button onclick="toggleM365Panel()" id="m365-button" class="btn-m365" title="Search Microsoft 365 & Box">
                 <i class="fab fa-microsoft"></i>
             </button>
@@ -1137,6 +1140,6 @@
         </div>
     </footer>
 
-    <script src="/static/script.js?v=6"></script>
+    <script src="/chat-script.js?v={{ deploy_sha|default('0') }}"></script>
 </body>
 </html>
