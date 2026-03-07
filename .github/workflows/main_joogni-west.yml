@@ -54,6 +54,13 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Enable Oryx build (required for pip install on server)
+        run: |
+          az webapp config appsettings set --name Joogni-West --resource-group GLG-AI --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true --output none
+
+      - name: Wait for SCM after config change
+        run: sleep 90
+
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
