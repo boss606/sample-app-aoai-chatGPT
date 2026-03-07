@@ -29,10 +29,6 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Bust Oryx build cache (force fresh deploy - Oryx caches by requirements.txt hash)
-        run: |
-          echo "# deploy=${{ github.sha }}" >> requirements.txt
-
       - name: Verify package contents before upload
         run: |
           echo "=== Files in deployment package ==="
@@ -52,7 +48,7 @@ jobs:
           name: python-app
           path: |
             .
-            !antenv/
+            !.git
 
   deploy:
     runs-on: ubuntu-latest
@@ -78,6 +74,16 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Disable Oryx (deploy our exact files, no build cache)
+        run: |
+          RG=$(az webapp show --name Joogni-West --query resourceGroup -o tsv)
+          az webapp config appsettings set --name Joogni-West --resource-group $RG --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false --output none
+
+      - name: Set startup command (use venv gunicorn)
+        run: |
+          RG=$(az webapp show --name Joogni-West --query resourceGroup -o tsv)
+          az webapp config set --name Joogni-West --resource-group $RG --startup-file "antenv/bin/gunicorn --bind=0.0.0.0:8000 --workers=2 -k uvicorn.workers.UvicornWorker app:app" --output none
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
