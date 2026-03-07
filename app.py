@@ -56,6 +56,19 @@ load_dotenv(override=False)
 
 app = FastAPI(title="Joogni", description="Multi-jurisdiction Legal AI Assistant")
 
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    """Prevent caching of static assets and chat page to ensure deployments are visible."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/") or path == "/chat":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 # Mount static files only if directory exists
 static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 if os.path.isdir(static_dir):

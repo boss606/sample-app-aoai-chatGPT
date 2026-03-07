@@ -9,13 +9,13 @@ WORKDIR /usr/src/app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- THIS IS THE CRITICAL PART WE WERE MISSING ---
 # Copy the entire backend application code
 COPY app.py .
 COPY backend/ ./backend/
-# ------------------------------------------------
+COPY templates/ ./templates/
+COPY static/ ./static/
 
-# Create the static UI directory and copy your new frontend files into it
+# Create the static UI directory and copy frontend files (alternate UI)
 RUN mkdir -p /usr/src/app/static/ui
 COPY frontend/index.html /usr/src/app/static/ui/
 COPY frontend/script.js /usr/src/app/static/ui/
