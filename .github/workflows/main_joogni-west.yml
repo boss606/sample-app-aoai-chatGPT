@@ -6,10 +6,6 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  APP_NAME: Joogni-West
-  RESOURCE_GROUP: GLG-AI
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,7 +25,7 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
 
-      - name: Create deploy marker
+      - name: Create deploy marker (app reads this at runtime for script cache busting)
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
@@ -64,7 +60,3 @@ jobs:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
-
-      - name: Restart Web App
-        run: |
-          az webapp restart --name ${{ env.APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
