@@ -1571,21 +1571,36 @@ function addMessage(text, type, isMarkdown) {
 function renderMarkdown(text) {
     if (!text) return '';
     
+    // 1. HTML escape
     var html = text
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
     
-    // Code blocks
+    // 2. Code blocks (preserve content)
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     
-    // Headers
+    // 3. Tables (GFM-style: header line, separator with dashes, body rows)
+    html = html.replace(/(?:^|\n)((?:\|[^\n]+\n)(?:\|[^\n]*\-[^\n]*\n)(?:(?:\|[^\n]+\n?)+))/g, function(match) {
+        var lines = match.trim().split('\n').filter(function(l) { return l.trim(); });
+        if (lines.length < 2) return match;
+        var headerCells = lines[0].split('|').slice(1, -1).map(function(c) { return c.trim(); });
+        var rows = lines.slice(2);
+        var thead = '<thead><tr>' + headerCells.map(function(c) { return '<th>' + c + '</th>'; }).join('') + '</tr></thead>';
+        var tbody = '<tbody>' + rows.map(function(row) {
+            var cells = row.split('|').slice(1, -1).map(function(c) { return c.trim(); });
+            return '<tr>' + cells.map(function(c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
+        }).join('') + '</tbody>';
+        return '<table class="prose-table">' + thead + tbody + '</table>';
+    });
+    
+    // 4. Headers
     html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
     html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
     html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
     
-    // Bold and italic
+    // 5. Bold and italic
     html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
@@ -1593,10 +1608,10 @@ function renderMarkdown(text) {
     // HR
     html = html.replace(/^---$/gm, '<hr>');
     
-    // Blockquotes
+    // 6. Blockquotes
     html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
     
-    // Numbered lists (process before bullet lists)
+    // 7. Numbered lists
     html = html.replace(/((?:^[\s]*\d+[.)]\s+.+$\n?)+)/gm, function(match) {
         var items = match.trim().split(/\n/).map(function(line) {
             var m = line.match(/^[\s]*\d+[.)]\s+(.+)$/);
@@ -1605,22 +1620,33 @@ function renderMarkdown(text) {
         return items.length ? '<ol>' + items.join('') + '</ol>' : match;
     });
     
-    // Bullet lists
-    html = html.replace(/^[\s]*[-*] (.+)$/gm, '<li>$1</li>');
-    html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+    // 8. Bullet lists (support -, *, + ; no newlines in output)
+    html = html.replace(/^[\s]*[-*+] (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*?<\/li>(?:\n?))+/g, function(match) {
+        var items = match.match(/<li>[\s\S]*?<\/li>/g) || [];
+        return items.length ? '<ul>' + items.join('') + '</ul>' : match;
+    });
     
-    // Links
+    // 9. Links
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
     
-    // Paragraphs
+    // 10. Paragraphs
     html = html.replace(/\n\n+/g, '</p><p>');
     html = html.replace(/\n/g, '<br>');
     
-    if (!html.startsWith('<h') && !html.startsWith('<ul') && !html.startsWith('<ol') && !html.startsWith('<pre') && !html.startsWith('<blockquote')) {
+    // 11. Summary block detection (wrap Bottom line, Summary, Conclusion, Recommendation)
+    var summaryLabels = /(<strong>\s*(?:Bottom line|Summary|Conclusion|Recommendation)\s*<\/strong>\s*:?\s*)([\s\S]*?)(?=<h[123]|<table|$)/gi;
+    html = html.replace(summaryLabels, function(match, label, content) {
+        content = content.replace(/^\s*<br\s*\/?>\s*/i, '').trim();
+        return '<div class="summary-block"><span class="summary-label">' + label.replace(/<strong>|<\/strong>/g, '').trim() + '</span>' + (content ? '<div>' + content + '</div>' : '') + '</div>';
+    });
+    
+    // 12. Wrap in p if needed
+    if (!html.startsWith('<h') && !html.startsWith('<ul') && !html.startsWith('<ol') && !html.startsWith('<pre') && !html.startsWith('<blockquote') && !html.startsWith('<table') && !html.startsWith('<div')) {
         html = '<p>' + html + '</p>';
     }
     
-    // Cleanup
+    // 13. Cleanup
     html = html.replace(/<p><\/p>/g, '');
     
     return html;
