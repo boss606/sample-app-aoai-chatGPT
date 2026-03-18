@@ -1595,10 +1595,14 @@ async def chat_page(request: Request):
             status_code=200
         )
     deploy_sha = _get_deploy_sha()
-    return templates.TemplateResponse("index.html", {
+    response = templates.TemplateResponse("index.html", {
         "request": request,
         "deploy_sha": deploy_sha,
     })
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/calculators", response_class=HTMLResponse)
