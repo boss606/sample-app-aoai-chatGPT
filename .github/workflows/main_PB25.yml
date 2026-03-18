@@ -31,6 +31,8 @@ jobs:
       uses: docker/build-push-action@v5 # Modern version
       with:
         push: true
+        build-args: |
+          GITHUB_SHA=${{ github.sha }}
         # Pushes to the correct image name 'sample-app-aoai-chatgpt'
         # Uses github.sha (commit hash) as the unique tag
         tags: glgacr.azurecr.io/sample-app-aoai-chatgpt:${{ github.sha }}

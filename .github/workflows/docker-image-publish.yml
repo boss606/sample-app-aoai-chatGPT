@@ -26,7 +26,7 @@ jobs:
       - name: Build, tag, and push image to Azure Container Registry
         run: | # Use multi-line run script for clarity
           # Build using WebApp.Dockerfile, tag with date/run number and 'latest'
-          docker build . --file WebApp.Dockerfile --tag glgacr.azurecr.io/sample-app-aoai-chatgpt:$(date +'%Y-%m-%d')_${{ github.run_number }}
+          docker build . --file WebApp.Dockerfile --build-arg GITHUB_SHA=${{ github.sha }} --tag glgacr.azurecr.io/sample-app-aoai-chatgpt:$(date +'%Y-%m-%d')_${{ github.run_number }}
           docker tag glgacr.azurecr.io/sample-app-aoai-chatgpt:$(date +'%Y-%m-%d')_${{ github.run_number }} glgacr.azurecr.io/sample-app-aoai-chatgpt:latest
           # Push both the specific tag and the 'latest' tag
           docker push glgacr.azurecr.io/sample-app-aoai-chatgpt:$(date +'%Y-%m-%d')_${{ github.run_number }}
