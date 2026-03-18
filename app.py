@@ -24,10 +24,9 @@ if TYPE_CHECKING:
     from openai import AzureOpenAI
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from openai import AzureOpenAI
 from azure.search.documents import SearchClient
@@ -66,7 +65,7 @@ async def add_no_cache_headers(request: Request, call_next):
     """Prevent caching of static assets and HTML pages to ensure deployments are visible."""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/static/") or path.startswith("/api/app-script") or path in NO_CACHE_PATHS or path == "/api/version":
+    if path.startswith("/static/") or path in NO_CACHE_PATHS or path == "/api/version":
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -86,15 +85,7 @@ if os.path.isdir("/home/site/wwwroot/templates"):
     templates_dir = "/home/site/wwwroot/templates"
 elif os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")):
     templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
-
-# Disable template cache so deployments are visible immediately (no stale HTML)
-jinja_env = Environment(
-    loader=FileSystemLoader(templates_dir),
-    autoescape=select_autoescape(["html", "htm", "xml"]),
-    cache_size=0,
-    auto_reload=True,
-)
-templates = Jinja2Templates(env=jinja_env)
+templates = Jinja2Templates(directory=templates_dir)
 
 # ============== Multi-Jurisdiction Registry ==============
 # Display name (from dropdown) -> internal jurisdiction id
@@ -1637,27 +1628,6 @@ def _get_deploy_sha() -> str:
     except Exception:
         pass
     return "not-deployed"
-
-
-@app.get("/api/app-script.js")
-async def serve_app_script():
-    """Serve chat script with strict no-cache - ensures fresh JS after deploy."""
-    script_path = os.path.join(static_dir, "script.js")
-    if not os.path.isfile(script_path):
-        script_path = "/home/site/wwwroot/static/script.js"
-    if not os.path.isfile(script_path):
-        raise HTTPException(status_code=404, detail="script.js not found")
-    with open(script_path, "r") as f:
-        content = f.read()
-    return Response(
-        content=content,
-        media_type="application/javascript",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
 
 
 @app.get("/api/version")
