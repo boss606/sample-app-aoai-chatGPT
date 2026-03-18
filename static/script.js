@@ -1386,9 +1386,10 @@ async function sendMessage() {
 
     // Add agentic status indicator
     var statusId = addAgenticStatus();
+    updateAgenticStatus(statusId, 'Searching legal sources...', true);
 
     try {
-        var response = await fetch('/api/agentic', {
+        var response = await fetch('/api/agentic/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
@@ -1403,39 +1404,90 @@ async function sendMessage() {
             credentials: 'same-origin'
         });
 
-        var data = await parseJsonResponse(response, 'chat');
-
-        if (data.error) {
+        if (!response.ok) {
+            var errData = await response.json().catch(function() { return { detail: response.statusText }; });
             removeMessage(statusId);
-            addMessage('Error: ' + data.error, 'system-error');
+            addMessage('Error: ' + (errData.detail || errData.error || response.statusText), 'system-error');
             messageHistory.pop();
             return;
         }
 
-        var jobId = data.job_id;
-        var result = await pollForResultWithStatus(jobId, statusId);
-        
-        removeMessage(statusId);
-
-        if (result.status === 'completed') {
-            var responseText = (result.response || data.response) || '';
-            addMessage(responseText, 'system', true);
-            messageHistory.push({ role: 'assistant', content: responseText });
-        } else if (result.status === 'Failed') {
-            addMessage('Error: ' + result.result, 'system-error');
+        if (!response.body) {
+            removeMessage(statusId);
+            addMessage('Streaming not supported.', 'system-error');
             messageHistory.pop();
-        } else {
-            addMessage('Request timed out. Please try again.', 'system-error');
-            messageHistory.pop();
+            return;
         }
 
-        // Do NOT clear attachments - keep for conversational continuity
+        removeMessage(statusId);
+        var streamingBubble = addStreamingMessageBubble();
+
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        var fullText = '';
+        var receivedDone = false;
+
+        while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            buffer += decoder.decode(result.value, { stream: true });
+            var lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+                if (line.startsWith('data: ')) {
+                    try {
+                        var ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'token') {
+                            fullText += ev.content || '';
+                            updateStreamingBubble(streamingBubble, fullText, false);
+                        } else if (ev.type === 'done') {
+                            receivedDone = ev.complete === true;
+                        } else if (ev.type === 'error') {
+                            fullText += '\n\n[Erro: ' + (ev.message || 'unknown') + ']';
+                        }
+                    } catch (e) { /* ignore parse errors */ }
+                }
+            }
+        }
+
+        updateStreamingBubble(streamingBubble, fullText, true);
+        if (!receivedDone && fullText) {
+            addMessage('Aviso: A resposta pode estar incompleta (conexão interrompida).', 'system');
+        }
+        messageHistory.push({ role: 'assistant', content: fullText });
 
     } catch (error) {
         removeMessage(statusId);
         addMessage('Failed to connect to server: ' + error.message, 'system-error');
         messageHistory.pop();
     }
+}
+
+function addStreamingMessageBubble() {
+    var container = document.getElementById('chat-container');
+    if (!container) return null;
+    var div = document.createElement('div');
+    div.className = 'message message-system';
+    var bubble = document.createElement('div');
+    bubble.className = 'message-bubble prose-chat';
+    bubble.textContent = '';
+    div.appendChild(bubble);
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    return { div: div, bubble: bubble };
+}
+
+function updateStreamingBubble(streamingBubble, text, isComplete) {
+    if (!streamingBubble || !streamingBubble.bubble) return;
+    if (isComplete && text) {
+        streamingBubble.bubble.innerHTML = renderMarkdown(text);
+    } else {
+        streamingBubble.bubble.textContent = text || '...';
+    }
+    var container = document.getElementById('chat-container');
+    if (container) container.scrollTop = container.scrollHeight;
 }
 
 function addAgenticStatus() {

@@ -18,13 +18,13 @@ import httpx
 import uuid
 import time
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, TYPE_CHECKING
+from typing import List, Tuple, Optional, TYPE_CHECKING, AsyncGenerator
 
 if TYPE_CHECKING:
     from openai import AzureOpenAI
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -245,9 +245,73 @@ VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "30"))
 PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "150"))
 PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
+# Below this token count, send full extracted text to LLM (skip RAG indexing)
+ATTACHMENT_FULL_TEXT_MAX_TOKENS = int(os.getenv("ATTACHMENT_FULL_TEXT_MAX_TOKENS", "4000"))
 
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 print("AZURE_OPENAI_EMBEDDING_DEPLOYMENT present:", bool(deployment_name))
+
+def _search_one_domain_sync(
+    search_client: SearchClient,
+    query: str,
+    query_vector: Optional[List[float]],
+    dom: str,
+    top_per_domain: int,
+):
+    """Sync helper: search one domain and return (dom, chunks). Used for parallel execution."""
+    from azure.search.documents.models import VectorizedQuery
+
+    kwargs = {"search_text": query, "top": top_per_domain}
+    kwargs["filter"] = f"domain eq '{dom}'"
+    if query_vector:
+        kwargs["vector_queries"] = [
+            VectorizedQuery(
+                vector=query_vector,
+                k_nearest_neighbors=top_per_domain,
+                fields="contentVector",
+            )
+        ]
+    results = search_client.search(**kwargs)
+    chunks = []
+    for r in results:
+        content = (r.get("content") or "").strip()
+        meta = (r.get("metadata") or "").strip()
+        source = r.get("filepath") or r.get("source") or r.get("url") or ""
+        if content:
+            chunks.append(f"[DOMAIN: {dom}] [Source: {source}]\n{content}\nMeta: {meta}")
+    return (dom, chunks)
+
+
+def _search_fallback_sync(
+    search_client: SearchClient,
+    query: str,
+    query_vector: Optional[List[float]],
+    top_per_domain: int,
+):
+    """Sync helper: fallback search when no domain has hits."""
+    from azure.search.documents.models import VectorizedQuery
+
+    kwargs = {"search_text": query, "top": top_per_domain}
+    if query_vector:
+        kwargs["vector_queries"] = [
+            VectorizedQuery(
+                vector=query_vector,
+                k_nearest_neighbors=top_per_domain,
+                fields="contentVector",
+            )
+        ]
+    results = search_client.search(**kwargs)
+    chunks = []
+    for r in results:
+        content = (r.get("content") or "").strip()
+        meta = (r.get("metadata") or "").strip()
+        source = r.get("filepath") or r.get("source") or r.get("url") or ""
+        if content:
+            chunks.append(
+                f"[DOMAIN: unknown] [Source: {source}]\n{content}\nMeta: {meta}"
+            )
+    return chunks
+
 
 def run_multi_domain_search(
     search_client: SearchClient,
@@ -259,8 +323,7 @@ def run_multi_domain_search(
 ):
     """
     Hybrid (vector + keyword) or keyword-only multi-domain search.
-    If embed_client is provided and EMBEDDING_DEPLOYMENT is set, uses hybrid search.
-    Returns (context_chunks, domains_with_hits).
+    Sync version for backwards compatibility.
     """
     from azure.search.documents.models import VectorizedQuery
 
@@ -268,7 +331,6 @@ def run_multi_domain_search(
     domains_with_hits = []
     candidates = [d.strip() for d in domains if d.strip()][:max_domains]
 
-    # Hybrid: embed query for vector search
     query_vector = None
     if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
         try:
@@ -281,55 +343,24 @@ def run_multi_domain_search(
         except Exception as e:
             print(f"Embedding error (fallback to keyword only): {e}", file=sys.stderr)
 
-    def _do_search(dom_filter: Optional[str] = None):
-        kwargs = {
-            "search_text": query,
-            "top": top_per_domain,
-        }
-        if dom_filter:
-            kwargs["filter"] = f"domain eq '{dom_filter}'"
-        if query_vector:
-            kwargs["vector_queries"] = [
-                VectorizedQuery(
-                    vector=query_vector,
-                    k_nearest_neighbors=top_per_domain,
-                    fields="contentVector",
-                )
-            ]
-        return search_client.search(**kwargs)
-
     for dom in candidates:
         try:
-            results = _do_search(dom_filter=dom)
-            hit_count = 0
-            for r in results:
-                content = (r.get("content") or "").strip()
-                meta = (r.get("metadata") or "").strip()
-                source = r.get("filepath") or r.get("source") or r.get("url") or ""
-                if not content:
-                    continue
-                context_chunks.append(
-                    f"[DOMAIN: {dom}] [Source: {source}]\n{content}\nMeta: {meta}"
-                )
-                hit_count += 1
-            if hit_count > 0:
+            _, chunks = _search_one_domain_sync(
+                search_client, query, query_vector, dom, top_per_domain
+            )
+            context_chunks.extend(chunks)
+            if chunks:
                 domains_with_hits.append(dom)
         except Exception as e:
             print(f"Search error for domain {dom}: {e}", file=sys.stderr)
 
     if not context_chunks:
         try:
-            results = _do_search(dom_filter=None)
-            for r in results:
-                content = (r.get("content") or "").strip()
-                meta = (r.get("metadata") or "").strip()
-                source = r.get("filepath") or r.get("source") or r.get("url") or ""
-                if not content:
-                    continue
-                context_chunks.append(
-                    f"[DOMAIN: unknown] [Source: {source}]\n{content}\nMeta: {meta}"
-                )
-            if context_chunks:
+            fallback_chunks = _search_fallback_sync(
+                search_client, query, query_vector, top_per_domain
+            )
+            context_chunks.extend(fallback_chunks)
+            if fallback_chunks:
                 domains_with_hits.append("unknown")
         except Exception as e:
             print(f"Fallback search error: {e}", file=sys.stderr)
@@ -337,20 +368,88 @@ def run_multi_domain_search(
     return context_chunks, domains_with_hits
 
 
-def run_user_attachment_search(
+async def run_multi_domain_search_async(
+    search_client: SearchClient,
+    query: str,
+    domains: List[str],
+    max_domains: int,
+    top_per_domain: int,
+    embed_client: Optional["AzureOpenAI"] = None,
+):
+    """
+    Async version: embedding and domain searches run via thread pool (no event loop blocking).
+    Domain searches run in parallel; results merged in deterministic domain order for quality.
+    """
+    candidates = [d.strip() for d in domains if d.strip()][:max_domains]
+    query_vector = None
+
+    if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
+        try:
+            emb = await asyncio.to_thread(
+                embed_client.embeddings.create,
+                model=EMBEDDING_DEPLOYMENT,
+                input=[query.strip()[:8000]],
+                dimensions=VECTOR_DIMENSION,
+            )
+            query_vector = emb.data[0].embedding
+        except Exception as e:
+            print(f"Embedding error (fallback to keyword only): {e}", file=sys.stderr)
+
+    # Run domain searches in parallel; merge in candidates order (deterministic)
+    tasks = [
+        asyncio.to_thread(
+            _search_one_domain_sync,
+            search_client,
+            query,
+            query_vector,
+            dom,
+            top_per_domain,
+        )
+        for dom in candidates
+    ]
+    domain_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    context_chunks = []
+    domains_with_hits = []
+    for i, res in enumerate(domain_results):
+        if isinstance(res, Exception):
+            print(f"Search error for domain {candidates[i]}: {res}", file=sys.stderr)
+            continue
+        dom, chunks = res
+        context_chunks.extend(chunks)
+        if chunks:
+            domains_with_hits.append(dom)
+
+    if not context_chunks:
+        try:
+            fallback_chunks = await asyncio.to_thread(
+                _search_fallback_sync,
+                search_client,
+                query,
+                query_vector,
+                top_per_domain,
+            )
+            context_chunks.extend(fallback_chunks)
+            if fallback_chunks:
+                domains_with_hits.append("unknown")
+        except Exception as e:
+            print(f"Fallback search error: {e}", file=sys.stderr)
+
+    return context_chunks, domains_with_hits
+
+
+def _run_user_attachment_search_sync(
     search_client: SearchClient,
     query: str,
     blob_names: List[str],
-    top_k: int = 6,
-    embed_client: Optional["AzureOpenAI"] = None,
+    top_k: int,
+    embed_client: Optional["AzureOpenAI"],
 ) -> List[str]:
-    """
-    Search user_attachment domain for the given blob_names (already indexed).
-    Returns context chunk strings for RAG.
-    """
+    """Sync implementation of user attachment search."""
     if not blob_names:
         return []
     from azure.search.documents.models import VectorizedQuery
+
     query_vector = None
     if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
         try:
@@ -367,14 +466,12 @@ def run_user_attachment_search(
         return []
     source_filter = " or ".join(f"source eq '{s}'" for s in safe_sources)
     filter_str = f"domain eq 'user_attachment' and ({source_filter})"
-    kwargs = {
-        "search_text": query,
-        "top": top_k,
-        "filter": filter_str,
-    }
+    kwargs = {"search_text": query, "top": top_k, "filter": filter_str}
     if query_vector:
         kwargs["vector_queries"] = [
-            VectorizedQuery(vector=query_vector, k_nearest_neighbors=top_k, fields="contentVector")
+            VectorizedQuery(
+                vector=query_vector, k_nearest_neighbors=top_k, fields="contentVector"
+            )
         ]
     context_chunks = []
     try:
@@ -388,6 +485,37 @@ def run_user_attachment_search(
     except Exception as e:
         print(f"[UserAttachment] Search error: {e}", file=sys.stderr)
     return context_chunks
+
+
+def run_user_attachment_search(
+    search_client: SearchClient,
+    query: str,
+    blob_names: List[str],
+    top_k: int = 6,
+    embed_client: Optional["AzureOpenAI"] = None,
+) -> List[str]:
+    """Search user_attachment domain for the given blob_names. Sync version."""
+    return _run_user_attachment_search_sync(
+        search_client, query, blob_names, top_k, embed_client
+    )
+
+
+async def run_user_attachment_search_async(
+    search_client: SearchClient,
+    query: str,
+    blob_names: List[str],
+    top_k: int = 6,
+    embed_client: Optional["AzureOpenAI"] = None,
+) -> List[str]:
+    """Async version: runs in thread pool to avoid blocking event loop."""
+    return await asyncio.to_thread(
+        _run_user_attachment_search_sync,
+        search_client,
+        query,
+        blob_names,
+        top_k,
+        embed_client,
+    )
 
 
 # Define tools for function calling
@@ -908,6 +1036,14 @@ def _chunk_text(text: str, max_tokens: int = 350, overlap: int = 60, max_chunks:
     return chunks
 
 
+def _count_tokens(text: str) -> int:
+    """Return token count using tiktoken. Falls back to char/4 estimate if unavailable."""
+    encoder = _get_tiktoken_encoder()
+    if encoder is not None:
+        return len(encoder.encode(text))
+    return len(text) // 4
+
+
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     denom = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
     if denom == 0:
@@ -916,6 +1052,38 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 EMBED_BATCH_SIZE = 24
+
+
+async def _fetch_full_text_context(blobs: List[dict]) -> List[str]:
+    """
+    Download and extract full text from blobs marked use_full_text (small docs that skipped RAG).
+    Returns list of context strings: [f"[Attachment: {filename}]\n{text}", ...]
+    """
+    if not blobs:
+        return []
+    storage = LegalDocsStorage()
+    upload_container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
+    sections: List[str] = []
+    for blob in blobs:
+        blob_name = blob.get("blob_name")
+        original_filename = blob.get("original_filename", "file.pdf")
+        if not blob_name:
+            continue
+        try:
+            file_bytes = await asyncio.to_thread(storage.download_file, blob_name, container=upload_container)
+            if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
+                continue
+            if not _is_supported_attachment(original_filename):
+                continue
+            text = await asyncio.to_thread(_extract_text_from_file, file_bytes, original_filename)
+            del file_bytes
+            gc.collect()
+            if not text or not text.strip():
+                continue
+            sections.append(f"[Attachment: {original_filename}]\n{text.strip()}")
+        except Exception as e:
+            print(f"[Attachment] Full-text fetch failed for {original_filename}: {e}", file=sys.stderr)
+    return sections
 
 
 async def _build_attachment_context(blobs: List[dict], query: str, client: AzureOpenAI) -> List[str]:
@@ -1080,6 +1248,11 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         text = _extract_text_from_file(file_bytes, original_filename)
         del file_bytes
         gc.collect()
+        token_count = _count_tokens(text)
+        if token_count <= ATTACHMENT_FULL_TEXT_MAX_TOKENS:
+            update_job_status(partition_key, job_id, "completed", use_full_text=True)
+            print(f"[Attachment] Job {job_id} completed (full-text): {blob_name} -> {token_count} tokens", file=sys.stderr)
+            return
         chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
         del text
         gc.collect()
@@ -1737,8 +1910,25 @@ async def _run_agentic_conversation(
         update_agentic_job(partition, job_id, "failed", error=str(e))
 
 
+def _stream_llm_to_queue_sync(client, model: str, messages: list, queue, loop, temperature: float = 0.7):
+    """Run LLM stream in sync context; put chunks in asyncio.Queue from a thread."""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=2000,
+        stream=True,
+    )
+    for chunk in stream:
+        content = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+        if content:
+            loop.call_soon_threadsafe(queue.put_nowait, content)
+    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+
 async def _execute_agentic_logic(
-    data: dict, user_prefix: str, graph_token: Optional[str]
+    data: dict, user_prefix: str, graph_token: Optional[str],
+    stream_queue: Optional[asyncio.Queue] = None,
 ) -> str:
     """Execute agentic conversation logic; returns response text or raises."""
     import sys
@@ -1831,8 +2021,9 @@ async def _execute_agentic_logic(
                 candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
                 search_query = normalize_to_text(search_query)
 
+                t0 = time.perf_counter()
                 print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
-                context_chunks, domains_with_hits = run_multi_domain_search(
+                context_chunks, domains_with_hits = await run_multi_domain_search_async(
                     search_client=search_client,
                     query=search_query,
                     domains=candidates,
@@ -1840,6 +2031,7 @@ async def _execute_agentic_logic(
                     top_per_domain=LEGAL_TOP_PER_DOMAIN,
                     embed_client=client,
                 )
+                print(f"[perf] run_multi_domain_search: {time.perf_counter() - t0:.2f}s", file=sys.stderr)
 
                 legal_mode = len(context_chunks) > 0
                 print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
@@ -1875,7 +2067,8 @@ async def _execute_agentic_logic(
                 )
             processing_names = []
             failed_jobs = []
-            ready_blob_names = []
+            full_text_blobs: List[dict] = []
+            rag_blob_names: List[str] = []
             for b in blobs_with_job:
                 att_job_id = b.get("job_id")
                 blob_name = b.get("blob_name")
@@ -1888,7 +2081,10 @@ async def _execute_agentic_logic(
                     continue
                 st = job.get("status", "pending")
                 if st == "completed":
-                    ready_blob_names.append(blob_name)
+                    if job.get("use_full_text") == "true":
+                        full_text_blobs.append(b)
+                    else:
+                        rag_blob_names.append(blob_name)
                 elif st == "failed":
                     failed_jobs.append((orig, job.get("error", "Unknown error")))
                 else:
@@ -1899,18 +2095,29 @@ async def _execute_agentic_logic(
             if failed_jobs:
                 err_parts = [f"{n}: {e}" for n, e in failed_jobs]
                 raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
-            if ready_blob_names and search_client:
+            if full_text_blobs:
                 try:
-                    attach_chunks = run_user_attachment_search(
+                    t0_ft = time.perf_counter()
+                    ft_sections = await _fetch_full_text_context(full_text_blobs)
+                    if ft_sections:
+                        attachment_contexts.extend(ft_sections)
+                    print(f"[perf] _fetch_full_text_context: {time.perf_counter() - t0_ft:.2f}s for {len(full_text_blobs)} blob(s)", file=sys.stderr)
+                except Exception as ft_err:
+                    print(f"[UserAttachment] Full-text fetch error: {ft_err}", file=sys.stderr)
+            if rag_blob_names and search_client:
+                try:
+                    t0_attach = time.perf_counter()
+                    attach_chunks = await run_user_attachment_search_async(
                         search_client=search_client,
                         query=search_query or "legal",
-                        blob_names=ready_blob_names,
+                        blob_names=rag_blob_names,
                         top_k=6,
                         embed_client=client,
                     )
+                    print(f"[perf] run_user_attachment_search: {time.perf_counter() - t0_attach:.2f}s", file=sys.stderr)
                     if attach_chunks:
                         attachment_contexts.extend(attach_chunks)
-                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(ready_blob_names)} blob(s)", file=sys.stderr)
+                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(rag_blob_names)} blob(s)", file=sys.stderr)
                 except Exception as ua_err:
                     print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
 
@@ -1961,15 +2168,29 @@ async def _execute_agentic_logic(
         print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
 
     try:
-        response = client.chat.completions.create(
+        t0_llm = time.perf_counter()
+        if stream_queue and not tools_for_request:
+            await asyncio.to_thread(
+                _stream_llm_to_queue_sync,
+                client,
+                deployment,
+                chat_messages,
+                stream_queue,
+                asyncio.get_event_loop(),
+                temperature,
+            )
+            print(f"[perf] chat.completions.create (1st, streamed): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
+            return ""
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
             model=deployment,
             messages=chat_messages,
             tools=tools_for_request,
             tool_choice="auto" if tools_for_request else None,
             temperature=temperature,
-            max_tokens=2000
+            max_tokens=2000,
         )
-        print(f"Azure OpenAI response received!", file=sys.stderr)
+        print(f"[perf] chat.completions.create (1st): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
     except Exception as api_error:
         print(f"Azure OpenAI API Error: {type(api_error).__name__}: {api_error}", file=sys.stderr)
         raise
@@ -2003,12 +2224,27 @@ async def _execute_agentic_logic(
                 "content": tool_result
             })
 
-        final_response = client.chat.completions.create(
+        t0_llm2 = time.perf_counter()
+        if stream_queue:
+            await asyncio.to_thread(
+                _stream_llm_to_queue_sync,
+                client,
+                deployment,
+                chat_messages,
+                stream_queue,
+                asyncio.get_event_loop(),
+                0.7,
+            )
+            print(f"[perf] chat.completions.create (2nd, after tools, streamed): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
+            return ""
+        final_response = await asyncio.to_thread(
+            client.chat.completions.create,
             model=deployment,
             messages=chat_messages,
             temperature=0.7,
-            max_tokens=2000
+            max_tokens=2000,
         )
+        print(f"[perf] chat.completions.create (2nd, after tools): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
         return final_response.choices[0].message.content or ""
 
     return response_message.content or ""
@@ -2079,6 +2315,95 @@ async def conversation(request: Request, background_tasks: BackgroundTasks):
             raise HTTPException(status_code=500, detail="Failed to create job")
         background_tasks.add_task(_run_agentic_conversation, job_id, user_prefix, data, graph_token)
         return JSONResponse({"job_id": job_id, "status": "pending"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _stream_agentic_events(
+    data: dict, user_prefix: str, graph_token: Optional[str]
+) -> AsyncGenerator[str, None]:
+    """Yield SSE-formatted events. Sends done event with complete=true for truncation detection."""
+    queue: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(
+        _execute_agentic_logic(data, user_prefix, graph_token, stream_queue=queue)
+    )
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=300.0)
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timeout'})}\n\n"
+                break
+            if chunk is None:
+                break
+            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'complete': True})}\n\n"
+    except asyncio.CancelledError:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise
+    finally:
+        await task
+
+
+@app.post("/api/agentic/stream")
+async def conversation_stream(request: Request):
+    """
+    Streaming chat via SSE. Same input as /api/agentic but streams tokens.
+    Frontend should detect 'done' event with complete=true; if absent, response may be truncated.
+    """
+    try:
+        data = await request.json()
+        jurisdiction_raw = data.get("jurisdiction", "California")
+        jid, j_config = resolve_jurisdiction(jurisdiction_raw)
+        display_name = j_config.get("display_name", jurisdiction_raw)
+        if not j_config.get("implemented"):
+            return JSONResponse({
+                "error": f"This state ({display_name}) is not yet supported.",
+                "code": "STATE_NOT_SUPPORTED"
+            }, status_code=400)
+        user_prefix = _get_user_blob_prefix(request)
+        graph_token = await get_valid_graph_token(request)
+        blobs = data.get("blobs", [])
+        if blobs:
+            for b in blobs:
+                fn = (b.get("original_filename") or b.get("blob_name") or "")
+                if not _is_supported_attachment(fn):
+                    raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and Word (.docx) are allowed.")
+            blobs_with_job = [b for b in blobs if b.get("job_id")]
+            blobs_without_job = [b for b in blobs if not b.get("job_id")]
+            if blobs_without_job:
+                names = [b.get("original_filename", "file") for b in blobs_without_job]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
+                )
+            processing_names = []
+            for b in blobs_with_job:
+                job = get_job(user_prefix, b.get("job_id"))
+                if not job or job.get("status") != "completed":
+                    processing_names.append(b.get("original_filename", "file"))
+            if processing_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Document(s) still processing: {', '.join(processing_names)}. Please wait and try again.",
+                )
+        return StreamingResponse(
+            _stream_agentic_events(data, user_prefix, graph_token),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     except HTTPException:
         raise
     except Exception as e:

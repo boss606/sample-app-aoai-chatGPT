@@ -95,8 +95,14 @@ def create_job(partition_key: str, job_id: str, blob_name: str, original_filenam
     return True
 
 
-def update_job_status(partition_key: str, job_id: str, status: str, error: Optional[str] = None) -> bool:
-    """Update job status (processing, completed, failed)."""
+def update_job_status(
+    partition_key: str,
+    job_id: str,
+    status: str,
+    error: Optional[str] = None,
+    use_full_text: Optional[bool] = None,
+) -> bool:
+    """Update job status (processing, completed, failed). Optionally set use_full_text for full-text mode (skip RAG)."""
     table = _ensure_table()
     if table:
         try:
@@ -104,6 +110,8 @@ def update_job_status(partition_key: str, job_id: str, status: str, error: Optio
             entity["status"] = status
             if error is not None:
                 entity["error"] = str(error)[:1000]
+            if use_full_text is not None:
+                entity["use_full_text"] = "true" if use_full_text else "false"
             table.update_entity(entity=entity)
             return True
         except Exception as e:
@@ -114,6 +122,8 @@ def update_job_status(partition_key: str, job_id: str, status: str, error: Optio
         _in_memory_jobs[key]["status"] = status
         if error is not None:
             _in_memory_jobs[key]["error"] = str(error)[:1000]
+        if use_full_text is not None:
+            _in_memory_jobs[key]["use_full_text"] = "true" if use_full_text else "false"
         return True
     return False
 
