@@ -68,6 +68,5 @@ jobs:
           slot-name: 'Production'
           package: .
 
-      - name: Restart app to ensure frontend files are loaded fresh
-        run: |
-          az webapp restart --name Joogni-West --resource-group GLG-AI --output none
+      - name: Restart app to load new files
+        run: az webapp restart --name Joogni-West --resource-group GLG-AI --output none
