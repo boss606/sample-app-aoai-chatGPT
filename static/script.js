@@ -1472,7 +1472,7 @@ function addStreamingMessageBubble() {
     div.className = 'message message-system';
     var bubble = document.createElement('div');
     bubble.className = 'message-bubble prose-chat';
-    bubble.textContent = '';
+    bubble.innerHTML = '<div style="display:flex;align-items:center;padding:4px 0;"><div class="loading-spinner"></div></div>';
     div.appendChild(bubble);
     container.appendChild(div);
     container.scrollTop = container.scrollHeight;
@@ -1483,9 +1483,12 @@ function updateStreamingBubble(streamingBubble, text, isComplete) {
     if (!streamingBubble || !streamingBubble.bubble) return;
     if (isComplete && text) {
         streamingBubble.bubble.innerHTML = renderMarkdown(text);
-    } else {
-        streamingBubble.bubble.textContent = text || '...';
+    } else if (isComplete && !text) {
+        streamingBubble.bubble.textContent = '...';
+    } else if (text) {
+        streamingBubble.bubble.textContent = text;
     }
+    /* Se text estiver vazio e ainda não completou, mantém o spinner */
     var container = document.getElementById('chat-container');
     if (container) container.scrollTop = container.scrollHeight;
 }
@@ -1713,7 +1716,7 @@ function addLoading(customText) {
     div.innerHTML = 
         '<div class="loading-bubble">' +
             '<div class="loading-spinner"></div>' +
-            '<span class="loading-text">' + (customText || 'Thinking...') + '</span>' +
+            (customText ? '<span class="loading-text">' + customText + '</span>' : '') +
         '</div>';
     div.id = 'loading-' + Date.now();
     container.appendChild(div);
