@@ -915,6 +915,20 @@
     </style>
 </head>
 <body>
+    <!-- Deploy version check: force reload if server has newer version (bypasses cache) -->
+    <script>
+    (function(){
+      var pageVer = '{{ deploy_sha|default("0") }}';
+      fetch('/api/version', { cache: 'no-store', credentials: 'same-origin' })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (d.deploy_sha && d.deploy_sha !== pageVer) {
+            window.location.href = window.location.pathname + (window.location.search ? '&' : '?') + '_=' + Date.now();
+          }
+        })
+        .catch(function(){});
+    })();
+    </script>
     <!-- Agreement Modal -->
     <div id="agreement-modal" class="modal-overlay hidden">
         <div class="agreement-modal">

@@ -21,10 +21,6 @@ COPY frontend/index.html /usr/src/app/static/ui/
 COPY frontend/script.js /usr/src/app/static/ui/
 COPY frontend/style.css /usr/src/app/static/ui/
 
-# Inject deploy SHA for cache busting (CI passes GITHUB_SHA, local builds use 'dev')
-ARG GITHUB_SHA=dev
-RUN echo -n "${GITHUB_SHA}" > DEPLOY_SHA.txt
-
 # Expose the port the app runs on (matches WEBSITES_PORT)
 EXPOSE 8000
 
