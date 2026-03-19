@@ -49,6 +49,10 @@ jobs:
         with:
           name: python-app
 
+      - name: Verify deploy artifact
+        run: |
+          test -f DEPLOY_SHA.txt && echo "DEPLOY_SHA.txt present: $(cat DEPLOY_SHA.txt)" || echo "WARNING: DEPLOY_SHA.txt missing"
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -67,3 +71,4 @@ jobs:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
+          clean: true   # Remove old files before deploy so frontend updates

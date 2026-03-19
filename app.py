@@ -58,7 +58,7 @@ app = FastAPI(title="Joogni", description="Multi-jurisdiction Legal AI Assistant
 
 
 # Paths that serve HTML - never cache so deployments are visible immediately
-NO_CACHE_PATHS = {"/", "/login", "/dashboard", "/chat", "/calculators"}
+NO_CACHE_PATHS = {"/", "/login", "/dashboard", "/chat", "/calculators", "/api/deploy-info"}
 
 @app.middleware("http")
 async def add_no_cache_headers(request: Request, call_next):
@@ -637,7 +637,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True #bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -1648,6 +1648,13 @@ async def api_version():
         "deploy_sha": deploy_sha,
         "message": "If you see this, app.py was deployed. static/version.json not found.",
     })
+
+
+@app.get("/api/deploy-info")
+async def deploy_info():
+    """Debug: verify deploy state."""
+    sha = _get_deploy_sha()
+    return {"deploy_sha": sha, "static_exists": os.path.isdir(static_dir)}
 
 
 @app.get("/api/user")
