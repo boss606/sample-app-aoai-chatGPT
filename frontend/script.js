@@ -180,7 +180,7 @@ function quickAction(action) {
     if (!input) return;
     
     var prompts = {
-        'draft': 'I need to draft a pleading. [Tell me the case name, type of pleading (motion, declaration, response, etc.), and key facts to include]',
+        'draft': 'I neeeeeeeeed to draft a pleading. [Tell me the case name, type of pleading (motion, declaration, response, etc.), and key facts to include]',
         'analyze': 'Please analyze the attached document and summarize the key points, identify any issues, and suggest next steps.',
         'legal': 'I have a legal question about California family law: [Ask your question]',
         'status': 'What is the current status of the [Client Name] case? Please check for any upcoming hearings, recent communications, and pending deadlines.',
