@@ -29,8 +29,10 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Refresh static file timestamps (ensures Azure overwrites all frontend files)
-        run: find static/ templates/ -exec touch {} +
+      - name: Stamp deploy SHA into static files (busts Oryx content cache)
+        run: |
+          echo "/* deploy:${{ github.sha }} */" >> static/script.js
+          echo "/* deploy:${{ github.sha }} */" >> static/style.css
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
