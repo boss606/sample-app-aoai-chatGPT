@@ -49,16 +49,12 @@ jobs:
         with:
           name: python-app
 
-      - name: Verify deploy artifact
-        run: |
-          test -f DEPLOY_SHA.txt && echo "DEPLOY_SHA.txt present: $(cat DEPLOY_SHA.txt)" || echo "WARNING: DEPLOY_SHA.txt missing"
-
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Configure deploy settings (Oryx + force overwrite)
+      - name: Enable Oryx build (required for pip install on server)
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
             --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
@@ -73,4 +69,3 @@ jobs:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
-          clean: true

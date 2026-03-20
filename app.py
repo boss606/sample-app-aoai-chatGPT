@@ -58,7 +58,7 @@ app = FastAPI(title="Joogni", description="Multi-jurisdiction Legal AI Assistant
 
 
 # Paths that serve HTML - never cache so deployments are visible immediately
-NO_CACHE_PATHS = {"/", "/login", "/dashboard", "/chat", "/calculators", "/api/deploy-info"}
+NO_CACHE_PATHS = {"/", "/login", "/dashboard", "/chat", "/calculators"}
 
 @app.middleware("http")
 async def add_no_cache_headers(request: Request, call_next):
@@ -1648,13 +1648,6 @@ async def api_version():
         "deploy_sha": deploy_sha,
         "message": "If you see this, app.py was deployed. static/version.json not found.",
     })
-
-
-@app.get("/api/deploy-info")
-async def deploy_info():
-    """Debug: verify deploy state."""
-    sha = _get_deploy_sha()
-    return {"deploy_sha": sha, "static_exists": os.path.isdir(static_dir)}
 
 
 @app.get("/api/user")
