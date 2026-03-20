@@ -29,6 +29,11 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
+      - name: Sync frontend source files to static/
+        run: |
+          cp frontend/script.js static/script.js
+          cp frontend/style.css static/style.css
+
       - name: Refresh static file timestamps (ensures Azure overwrites all frontend files)
         run: find static/ templates/ -exec touch {} +
 
@@ -66,9 +71,10 @@ jobs:
       - name: Wait for SCM after config change
         run: sleep 90
 
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: 'Joogni-West'
-          slot-name: 'Production'
-          package: .
+      - name: Create deployment zip
+        run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
+
+      - name: Deploy to Azure Web App (clean deploy ensures all files are replaced)
+        run: |
+          az webapp deploy --resource-group GLG-AI --name Joogni-West \
+            --src-path deploy.zip --type zip --clean true --async false

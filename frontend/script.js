@@ -1,410 +1,1748 @@
-const chatMessages = document.getElementById('chat-messages');
-const userInput = document.getElementById('user-input');
-const sendButton = document.getElementById('send-button');
-const suggestedPrompts = document.getElementById('suggested-prompts');
-const jurisdictionSelect = document.getElementById('jurisdiction-select');
-let typingIndicator; // To keep track of the indicator element
-let currentConversationId = null; // To store the current conversation ID
-let messageHistory = []; // To store message history for the backend
+// Track attached files and emails
+var attachedFiles = [];
+var selectedEmails = [];
+var selectedCalendarEvents = [];
+// Pollers for attachment job status (job_id -> intervalId)
+var attachmentJobPollers = {};
+// Conversation history for backend continuity (reuse context across turns)
+var messageHistory = [];
+var searchSource = 'email';
+var selectedM365Items = [];
+var boxConnected = false;
+var boxAuthWindow = null;
+var boxBreadcrumbs = [{id: '0', name: 'All Files'}];
+var boxCurrentFolder = '0';
 
-// --- Initialization ---
-document.addEventListener('DOMContentLoaded', () => {
-    adjustInputHeight();
+console.log('Joogni script loaded');
+
+/** Safely parse JSON from a fetch Response. Throws with a clear message if body is empty or invalid. */
+async function parseJsonResponse(response, context) {
+    var text = await response.text();
+    if (!text || !text.trim()) {
+        var hint = response.status === 0 ? 'Connection closed or timeout' : 'Empty response from server';
+        throw new Error(hint + (context ? ' (' + context + ')' : ''));
+    }
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        var preview = text.length > 100 ? text.substring(0, 100) + '...' : text;
+        throw new Error('Invalid response: expected JSON but received: ' + preview);
+    }
+}
+
+// --- AGREEMENT FUNCTIONS ---
+
+async function checkAgreement() {
+    console.log('Checking agreement...');
+    try {
+        var response = await fetch('/api/check-agreement');
+        var data = await response.json();
+        console.log('Agreement check response:', data);
+        
+        if (data.error) {
+            console.error('Agreement check error:', data.error);
+            showAgreementModal();
+            return;
+        }
+        
+        if (!data.accepted) {
+            console.log('Agreement not accepted, showing modal');
+            showAgreementModal();
+        } else {
+            console.log('Agreement already accepted');
+        }
+    } catch (error) {
+        console.error('Agreement check failed:', error);
+        showAgreementModal();
+    }
+}
+
+function showAgreementModal() {
+    console.log('Showing agreement modal');
+    var modal = document.getElementById('agreement-modal');
+    if (modal) {
+        modal.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+    } else {
+        console.error('Agreement modal not found!');
+    }
+}
+
+function hideAgreementModal() {
+    var modal = document.getElementById('agreement-modal');
+    if (modal) {
+        modal.classList.add('hidden');
+        document.body.style.overflow = '';
+    }
+}
+
+function updateAcceptButton() {
+    var checkbox = document.getElementById('agree-checkbox');
+    var button = document.getElementById('accept-btn');
+    if (checkbox && button) {
+        button.disabled = !checkbox.checked;
+    }
+}
+
+async function acceptAgreement() {
+    var button = document.getElementById('accept-btn');
+    if (!button) return;
+    
+    button.disabled = true;
+    button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+    
+    try {
+        var response = await fetch('/api/accept-agreement', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        
+        var data = await response.json();
+        console.log('Accept agreement response:', data);
+        
+        if (data.success) {
+            hideAgreementModal();
+            addMessage('✅ Terms accepted. Welcome to Joogni!', 'system');
+        } else {
+            button.innerHTML = '<i class="fas fa-check"></i> Accept & Continue';
+            button.disabled = false;
+            alert('Failed to save agreement: ' + (data.error || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('Accept agreement error:', error);
+        button.innerHTML = '<i class="fas fa-check"></i> Accept & Continue';
+        button.disabled = false;
+        alert('Failed to save agreement: ' + error.message);
+    }
+}
+
+// Check agreement on page load
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('DOM loaded, checking agreement...');
+    checkAgreement();
+    checkBoxStatus();
+    loadUserInfo();
     updateSendButtonState();
-    initializeTypingIndicator(); // Prepare indicator element
-    addEventListeners();
-    // Optional: Load chat history or start new conversation
-    // startNewConversation(); 
 });
 
-// --- Event Listeners ---
-function addEventListeners() {
-    userInput.addEventListener('input', () => {
-        adjustInputHeight();
-        updateSendButtonState();
-    });
-
-    userInput.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' && !event.shiftKey) {
-            event.preventDefault();
-            sendMessage();
+// Delete uploaded blobs from storage when page unloads/reloads
+function cleanupAttachedBlobsOnUnload() {
+    if (attachedFiles.length > 0) {
+        var blobNames = attachedFiles.map(function(f) { return f.blob_name; }).filter(Boolean);
+        if (blobNames.length > 0 && navigator.sendBeacon) {
+            var blob = new Blob([JSON.stringify({ blob_names: blobNames })], { type: 'application/json' });
+            navigator.sendBeacon('/api/delete-attachment', blob);
         }
-    });
+    }
+}
+window.addEventListener('beforeunload', cleanupAttachedBlobsOnUnload);
+window.addEventListener('pagehide', cleanupAttachedBlobsOnUnload);
 
-    sendButton.addEventListener('click', sendMessage);
+// --- USER INFO ---
 
-    suggestedPrompts.addEventListener('click', (event) => {
-        if (event.target.classList.contains('prompt-btn')) {
-            userInput.value = event.target.textContent;
-            userInput.focus();
-            adjustInputHeight();
-            updateSendButtonState();
-            // Optional: Immediately send the prompt
-            // sendMessage();
+async function loadUserInfo() {
+    try {
+        var response = await fetch('/api/user-info');
+        var data = await response.json();
+        
+        var userNameEl = document.getElementById('user-name');
+        if (userNameEl && data.authenticated) {
+            // Show name if available, otherwise show email
+            var displayName = data.name || data.email || 'User';
+            // Shorten email if needed
+            if (!data.name && data.email && data.email.length > 25) {
+                displayName = data.email.split('@')[0];
+            }
+            userNameEl.textContent = displayName;
+            userNameEl.title = data.email || ''; // Show full email on hover
         }
-    });
-
-    // Event delegation for copy/feedback buttons
-    chatMessages.addEventListener('click', (event) => {
-        const target = event.target.closest('button'); // Find the closest button clicked
-        if (!target) return;
-
-        const messageDiv = target.closest('.message.bot');
-        if (!messageDiv) return;
-
-        if (target.classList.contains('copy-btn')) {
-            copyMessageToClipboard(messageDiv);
-        } else if (target.classList.contains('feedback-btn')) {
-            handleFeedback(target);
-        }
-    });
+    } catch (error) {
+        console.error('Failed to load user info:', error);
+    }
 }
 
-// --- Core Functions ---
-// *** UPDATED sendMessage Function ***
-async function sendMessage() {
-    const messageText = userInput.value.trim();
-    const selectedJurisdiction = jurisdictionSelect.value; // Get selected jurisdiction
+// Listen for Box auth success
+window.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'box-auth-success') {
+        console.log('Box auth success received');
+        boxConnected = true;
+        if (searchSource === 'box') {
+            searchM365();
+        }
+        addMessage('✅ Box connected successfully!', 'system');
+    }
+});
 
-    if (messageText) {
-        displayMessage(messageText, 'user'); // Display user message immediately
-        userInput.value = '';
-        adjustInputHeight();
-        updateSendButtonState();
-        showTypingIndicator();
+// --- QUICK ACTIONS ---
 
-        // Add user message to local history
-        // Prepend jurisdiction context to the user message content
-        const currentMessage = { role: 'user', content: `(Jurisdiction: ${selectedJurisdiction}) ${messageText}` };
-        messageHistory.push(currentMessage);
+function quickAction(action) {
+    var input = document.getElementById('user-input');
+    if (!input) return;
+    
+    var prompts = {
+        'draft': 'I need to draft a pleading. [Tell me the case name, type of pleading (motion, declaration, response, etc.), and key facts to include]',
+        'analyze': 'Please analyze the attached document and summarize the key points, identify any issues, and suggest next steps.',
+        'legal': 'I have a legal question about California family law: [Ask your question]',
+        'status': 'What is the current status of the [Client Name] case? Please check for any upcoming hearings, recent communications, and pending deadlines.',
+        'evidence': 'Please help me organize the evidence for the [Client Name] case. Create a list of exhibits with descriptions, categorized by type (financial, communications, declarations, etc.)',
+        'chronology': 'Create a case chronology for [Client Name]. Include key dates, events, and facts from the case files, emails, and calendar. Format as a timeline.'
+    };
+    
+    input.value = prompts[action] || '';
+    input.focus();
+    
+    // Select the placeholder text for easy replacement
+    var placeholderMatch = input.value.match(/\[.*?\]/);
+    if (placeholderMatch) {
+        var start = input.value.indexOf(placeholderMatch[0]);
+        var end = start + placeholderMatch[0].length;
+        input.setSelectionRange(start, end);
+    }
+}
 
-        const requestBody = {
-            messages: messageHistory,
-            conversation_id: currentConversationId // Pass current conversation ID (can be null)
-            // stream: false // Explicitly ask for non-streaming? Backend seems to handle it.
+function usePrompt(prompt) {
+    var input = document.getElementById('user-input');
+    if (!input) return;
+    
+    input.value = prompt;
+    input.focus();
+}
+
+// --- BOX FUNCTIONS ---
+
+async function checkBoxStatus() {
+    try {
+        var response = await fetch('/api/box/status');
+        var data = await response.json();
+        boxConnected = data.connected;
+        console.log('Box status:', data);
+    } catch (error) {
+        console.error('Box status check failed:', error);
+        boxConnected = false;
+    }
+}
+
+async function connectBox() {
+    try {
+        var response = await fetch('/api/box/auth');
+        var data = await response.json();
+        
+        if (data.error) {
+            addMessage('Box error: ' + data.error, 'system-error');
+            return;
+        }
+        
+        // Open auth window
+        boxAuthWindow = window.open(data.auth_url, 'BoxAuth', 'width=600,height=700');
+    } catch (error) {
+        addMessage('Failed to start Box connection: ' + error.message, 'system-error');
+    }
+}
+
+async function searchBox(query) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    // If empty query, browse root folder
+    if (!query) {
+        boxBreadcrumbs = [{id: '0', name: 'All Files'}];
+        browseBoxFolder('0', 'All Files', true);
+        return;
+    }
+    
+    // Reset breadcrumbs for search
+    boxBreadcrumbs = [{id: '0', name: 'All Files'}, {id: 'search', name: 'Search: "' + query + '"'}];
+    
+    resultsDiv.innerHTML = 
+        '<div style="display: flex; align-items: center; justify-content: center; padding: 40px; gap: 12px;">' +
+            '<div class="loading-spinner"></div>' +
+            '<span style="color: var(--gray-500); font-size: 13px;">Searching Box...</span>' +
+        '</div>';
+    
+    try {
+        var response = await fetch('/api/box/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: query })
+        });
+        
+        var data = await response.json();
+        
+        if (data.need_auth) {
+            boxConnected = false;
+            resultsDiv.innerHTML = 
+                '<div style="text-align: center; padding: 40px 20px;">' +
+                    '<i class="fas fa-box" style="font-size: 48px; color: #0061d5; margin-bottom: 16px;"></i>' +
+                    '<p style="color: var(--gray-600); margin-bottom: 16px;">Connect your Box account to search files</p>' +
+                    '<button onclick="connectBox()" class="box-connect-btn" style="margin: 0 auto;">' +
+                        '<i class="fas fa-link"></i> Connect Box' +
+                    '</button>' +
+                '</div>';
+            return;
+        }
+        
+        if (data.error) {
+            resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);"><i class="fas fa-exclamation-circle" style="margin-right: 8px;"></i>' + data.error + '</p>';
+            return;
+        }
+        
+        var items = data.entries || data.value || [];
+        
+        if (items.length === 0) {
+            resultsDiv.innerHTML = '<p class="m365-results-empty">No files found for "' + escapeHtml(query) + '". Try a different search term.</p>';
+            return;
+        }
+        
+        renderBoxResults(items, true);
+        
+    } catch (error) {
+        resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);">Search failed: ' + error.message + '</p>';
+    }
+}
+
+// Track Box navigation
+var boxBreadcrumbs = [{id: '0', name: 'All Files'}];
+var boxCurrentFolder = '0';
+
+function renderBoxResults(items, isSearch) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    // Sort: folders first, then files alphabetically
+    var folders = items.filter(function(i) { return i.type === 'folder'; });
+    var files = items.filter(function(i) { return i.type === 'file'; });
+    
+    folders.sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
+    files.sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
+    
+    var sortedItems = folders.concat(files);
+    
+    var html = '';
+    
+    // Breadcrumb navigation (only when browsing, not searching)
+    if (!isSearch && boxBreadcrumbs.length > 0) {
+        html += '<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 12px; font-size: 13px; flex-wrap: wrap;">';
+        boxBreadcrumbs.forEach(function(crumb, index) {
+            if (index > 0) {
+                html += '<i class="fas fa-chevron-right" style="color: var(--gray-400); font-size: 10px;"></i>';
+            }
+            if (index === boxBreadcrumbs.length - 1) {
+                html += '<span style="color: var(--gray-900); font-weight: 600;">' + escapeHtml(crumb.name) + '</span>';
+            } else {
+                html += '<a href="#" onclick="navigateBoxBreadcrumb(' + index + '); return false;" style="color: var(--primary-500); text-decoration: none;">' + escapeHtml(crumb.name) + '</a>';
+            }
+        });
+        html += '</div>';
+    }
+    
+    // Summary
+    html += '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">';
+    html += '<span style="font-size: 12px; color: var(--gray-500);"><i class="fas fa-info-circle" style="margin-right: 6px;"></i>' + folders.length + ' folders, ' + files.length + ' files</span>';
+    html += '</div>';
+    
+    // Render folders first with distinct styling
+    if (folders.length > 0) {
+        folders.forEach(function(item) {
+            html += 
+                '<div class="search-result" style="background: #fffbeb; border-color: #fde68a;" ' +
+                    'data-type="box-folder" ' +
+                    'data-id="' + item.id + '" ' +
+                    'data-name="' + escapeHtml(item.name || 'Folder') + '" ' +
+                    'onclick="browseBoxFolder(\'' + item.id + '\', \'' + escapeHtml(item.name || 'Folder').replace(/'/g, "\\'") + '\')">' +
+                    '<div class="result-icon folder"><i class="fas fa-folder" style="color: #f59e0b;"></i></div>' +
+                    '<div class="result-content">' +
+                        '<div class="result-title"><span class="truncate">' + escapeHtml(item.name || 'Folder') + '</span></div>' +
+                        '<div class="result-meta">Folder</div>' +
+                    '</div>' +
+                    '<i class="fas fa-chevron-right" style="color: var(--gray-400);"></i>' +
+                '</div>';
+        });
+    }
+    
+    // Render files
+    if (files.length > 0) {
+        files.forEach(function(item) {
+            var date = item.modified_at ? new Date(item.modified_at).toLocaleDateString() : '';
+            var size = item.size ? formatFileSize(item.size) : '';
+            var icon = getFileIcon(item.name || 'file');
+            var parent = item.parent ? item.parent.name : '';
+            
+            html += 
+                '<div class="search-result" ' +
+                    'data-type="box-file" ' +
+                    'data-id="' + item.id + '" ' +
+                    'data-name="' + escapeHtml(item.name || 'File') + '" ' +
+                    'onclick="toggleBoxFileSelection(this, \'' + item.id + '\', \'' + escapeHtml(item.name || 'File').replace(/'/g, "\\'") + '\')">' +
+                    '<div class="result-icon box"><i class="fas ' + icon + '" style="color: #0061d5;"></i></div>' +
+                    '<div class="result-content">' +
+                        '<div class="result-title"><span class="truncate">' + escapeHtml(item.name || 'File') + '</span></div>' +
+                        '<div class="result-meta">' + size + (date ? ' • ' + date : '') + '</div>' +
+                        (isSearch && parent ? '<div class="result-preview">in ' + escapeHtml(parent) + '</div>' : '') +
+                    '</div>' +
+                    '<div class="result-check"><i class="fas fa-check-circle"></i></div>' +
+                '</div>';
+        });
+    }
+    
+    if (sortedItems.length === 0) {
+        html += '<p class="m365-results-empty">This folder is empty</p>';
+    }
+    
+    resultsDiv.innerHTML = html;
+}
+
+function navigateBoxBreadcrumb(index) {
+    // Truncate breadcrumbs to this level
+    boxBreadcrumbs = boxBreadcrumbs.slice(0, index + 1);
+    var targetFolder = boxBreadcrumbs[index];
+    browseBoxFolder(targetFolder.id, targetFolder.name, true);
+}
+
+async function browseBoxFolder(folderId, folderName, isBackNav) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    // Update breadcrumbs
+    if (!isBackNav) {
+        if (folderId === '0') {
+            boxBreadcrumbs = [{id: '0', name: 'All Files'}];
+        } else if (folderName) {
+            boxBreadcrumbs.push({id: folderId, name: folderName});
+        }
+    }
+    boxCurrentFolder = folderId;
+    
+    resultsDiv.innerHTML = 
+        '<div style="display: flex; align-items: center; justify-content: center; padding: 40px; gap: 12px;">' +
+            '<div class="loading-spinner"></div>' +
+            '<span style="color: var(--gray-500); font-size: 13px;">Loading folder...</span>' +
+        '</div>';
+    
+    try {
+        var response = await fetch('/api/box/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: '', folder_id: folderId })
+        });
+        
+        var data = await response.json();
+        
+        if (data.error) {
+            resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);">' + data.error + '</p>';
+            return;
+        }
+        
+        var items = data.entries || data.value || [];
+        renderBoxResults(items, false);
+        
+    } catch (error) {
+        resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);">' + error.message + '</p>';
+    }
+}
+
+function toggleBoxFileSelection(element, fileId, fileName) {
+    var existingIndex = selectedM365Items.findIndex(function(item) { return item.id === fileId && item.type === 'box-file'; });
+    
+    if (existingIndex >= 0) {
+        selectedM365Items.splice(existingIndex, 1);
+        element.classList.remove('selected');
+    } else {
+        selectedM365Items.push({
+            type: 'box-file',
+            id: fileId,
+            name: fileName
+        });
+        element.classList.add('selected');
+    }
+    
+    updateSelectedCount();
+}
+
+// --- CHAT FUNCTIONS ---
+
+function handleEnter(e) {
+    if (e.key === 'Enter') sendMessage();
+}
+
+// --- M365 SEARCH FUNCTIONS ---
+
+function toggleM365Panel() {
+    console.log('Toggle M365 panel');
+    var panel = document.getElementById('m365-panel');
+    var button = document.getElementById('m365-button');
+    
+    if (!panel || !button) {
+        console.error('M365 panel or button not found');
+        return;
+    }
+    
+    if (panel.classList.contains('hidden')) {
+        panel.classList.remove('hidden');
+        button.classList.add('active');
+        document.getElementById('m365-search-input').focus();
+    } else {
+        closeM365Panel();
+    }
+}
+
+function closeM365Panel() {
+    var panel = document.getElementById('m365-panel');
+    var button = document.getElementById('m365-button');
+    
+    if (panel) panel.classList.add('hidden');
+    if (button) button.classList.remove('active');
+    selectedM365Items = [];
+    updateSelectedCount();
+}
+
+function setSearchSource(source) {
+    searchSource = source;
+    
+    var emailBtn = document.getElementById('src-email');
+    var filesBtn = document.getElementById('src-files');
+    var calendarBtn = document.getElementById('src-calendar');
+    var boxBtn = document.getElementById('src-box');
+    var searchInput = document.getElementById('m365-search-input');
+    
+    if (emailBtn) emailBtn.classList.remove('active');
+    if (filesBtn) filesBtn.classList.remove('active');
+    if (calendarBtn) calendarBtn.classList.remove('active');
+    if (boxBtn) boxBtn.classList.remove('active');
+    
+    var activeBtn;
+    switch(source) {
+        case 'email': activeBtn = emailBtn; break;
+        case 'files': activeBtn = filesBtn; break;
+        case 'calendar': activeBtn = calendarBtn; break;
+        case 'box': activeBtn = boxBtn; break;
+    }
+    if (activeBtn) activeBtn.classList.add('active');
+    
+    var placeholders = {
+        'email': 'Search emails...',
+        'files': 'Search OneDrive files...',
+        'calendar': 'Search calendar events...',
+        'box': 'Search Box files...'
+    };
+    if (searchInput) searchInput.placeholder = placeholders[source];
+    
+    var resultsDiv = document.getElementById('m365-results');
+    if (resultsDiv) {
+        if (source === 'box') {
+            if (!boxConnected) {
+                resultsDiv.innerHTML = 
+                    '<div style="text-align: center; padding: 40px 20px;">' +
+                        '<i class="fas fa-box" style="font-size: 48px; color: #0061d5; margin-bottom: 16px;"></i>' +
+                        '<p style="color: var(--gray-600); margin-bottom: 16px;">Connect your Box account to search files</p>' +
+                        '<button onclick="connectBox()" class="box-connect-btn" style="margin: 0 auto;">' +
+                            '<i class="fas fa-link"></i> Connect Box' +
+                        '</button>' +
+                    '</div>';
+            } else {
+                // Auto-browse root folder when Box tab is selected
+                boxBreadcrumbs = [{id: '0', name: 'All Files'}];
+                browseBoxFolder('0', 'All Files', true);
+            }
+        } else {
+            var sourceNames = {
+                'email': 'Outlook emails',
+                'files': 'OneDrive files',
+                'calendar': 'calendar events',
+                'box': 'Box files'
+            };
+            resultsDiv.innerHTML = '<p class="m365-results-empty">Search your ' + sourceNames[source] + '</p>';
+        }
+    }
+    selectedM365Items = [];
+    updateSelectedCount();
+}
+
+async function searchM365() {
+    var query = document.getElementById('m365-search-input').value.trim();
+    
+    // Handle Box separately
+    if (searchSource === 'box') {
+        searchBox(query);
+        return;
+    }
+    
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    var sourceNames = { 'email': 'Outlook', 'files': 'OneDrive', 'calendar': 'Calendar' };
+    
+    resultsDiv.innerHTML = 
+        '<div style="display: flex; align-items: center; justify-content: center; padding: 40px; gap: 12px;">' +
+            '<div class="loading-spinner"></div>' +
+            '<span style="color: var(--gray-500); font-size: 13px;">Searching ' + sourceNames[searchSource] + '...</span>' +
+        '</div>';
+    
+    try {
+        var endpoint = searchSource === 'calendar' ? '/api/search-calendar' : 
+                       searchSource === 'email' ? '/api/search-outlook' : '/api/search-onedrive';
+        
+        var response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: query })
+        });
+        
+        var data = await response.json();
+        
+        if (data.error) {
+            resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);"><i class="fas fa-exclamation-circle" style="margin-right: 8px;"></i>' + data.error + '</p>';
+            return;
+        }
+        
+        var items = data.value || [];
+        
+        if (items.length === 0) {
+            resultsDiv.innerHTML = '<p class="m365-results-empty">No results found</p>';
+            return;
+        }
+        
+        if (searchSource === 'email') renderEmailResults(items);
+        else if (searchSource === 'calendar') renderCalendarResults(items);
+        else renderFileResults(items);
+        
+    } catch (error) {
+        resultsDiv.innerHTML = '<p class="m365-results-empty" style="color: var(--error);">Search failed: ' + error.message + '</p>';
+    }
+}
+
+function renderCalendarResults(events) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    var html = '<div style="margin-bottom: 12px; font-size: 12px; color: var(--gray-500);"><i class="fas fa-info-circle" style="margin-right: 6px;"></i>Click events to select them for analysis.</div>';
+    
+    events.forEach(function(event) {
+        var startDate = new Date(event.start?.dateTime || event.start?.date);
+        var endDate = new Date(event.end?.dateTime || event.end?.date);
+        var dateStr = startDate.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+        var timeStr = event.isAllDay ? 'All Day' : startDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) + ' - ' + endDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        var location = event.location?.displayName || '';
+        
+        html += 
+            '<div class="search-result" ' +
+                'data-type="calendar" ' +
+                'data-id="' + event.id + '" ' +
+                'data-subject="' + escapeHtml(event.subject || 'No Title') + '" ' +
+                'data-start="' + (event.start?.dateTime || event.start?.date) + '" ' +
+                'data-end="' + (event.end?.dateTime || event.end?.date) + '" ' +
+                'data-location="' + escapeHtml(location) + '" ' +
+                'data-body="' + escapeHtml(event.bodyPreview || '') + '" ' +
+                'onclick="toggleCalendarSelection(this, \'' + event.id + '\')">' +
+                '<div class="result-icon calendar"><i class="fas fa-calendar-day"></i></div>' +
+                '<div class="result-content">' +
+                    '<div class="result-title"><span class="truncate">' + escapeHtml(event.subject || 'No Title') + '</span></div>' +
+                    '<div class="result-meta">' + dateStr + ' • ' + timeStr + '</div>' +
+                    (location ? '<div class="result-preview"><i class="fas fa-map-marker-alt" style="margin-right: 4px;"></i>' + escapeHtml(location) + '</div>' : '') +
+                '</div>' +
+                '<div class="result-check"><i class="fas fa-check-circle"></i></div>' +
+            '</div>';
+    });
+    
+    resultsDiv.innerHTML = html;
+}
+
+function toggleCalendarSelection(element, eventId) {
+    var existingIndex = selectedM365Items.findIndex(function(item) { return item.id === eventId; });
+    
+    if (existingIndex >= 0) {
+        selectedM365Items.splice(existingIndex, 1);
+        element.classList.remove('selected');
+    } else {
+        selectedM365Items.push({
+            type: 'calendar',
+            id: eventId,
+            subject: element.dataset.subject,
+            start: element.dataset.start,
+            end: element.dataset.end,
+            location: element.dataset.location,
+            body: element.dataset.body
+        });
+        element.classList.add('selected');
+    }
+    
+    updateSelectedCount();
+}
+
+function renderEmailResults(emails) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    var html = '<div style="margin-bottom: 12px; font-size: 12px; color: var(--gray-500);"><i class="fas fa-info-circle" style="margin-right: 6px;"></i>Click emails to select. Full content will be included.</div>';
+    
+    emails.forEach(function(email) {
+        var date = new Date(email.receivedDateTime).toLocaleDateString();
+        var time = new Date(email.receivedDateTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        var sender = email.from?.emailAddress?.name || email.from?.emailAddress?.address || 'Unknown';
+        var senderEmail = email.from?.emailAddress?.address || '';
+        var hasAttachments = email.hasAttachments;
+        
+        html += 
+            '<div class="search-result" ' +
+                'data-type="email" ' +
+                'data-id="' + email.id + '" ' +
+                'data-subject="' + escapeHtml(email.subject || 'No Subject') + '" ' +
+                'data-has-attachments="' + hasAttachments + '" ' +
+                'data-sender="' + escapeHtml(sender) + '" ' +
+                'data-sender-email="' + escapeHtml(senderEmail) + '" ' +
+                'data-date="' + email.receivedDateTime + '" ' +
+                'onclick="toggleEmailSelection(this, \'' + email.id + '\')">' +
+                '<div class="result-icon email"><i class="fas fa-envelope"></i></div>' +
+                '<div class="result-content">' +
+                    '<div class="result-title">' +
+                        '<span class="truncate">' + escapeHtml(email.subject || 'No Subject') + '</span>' +
+                        (hasAttachments ? '<i class="fas fa-paperclip" style="color: var(--gray-400); font-size: 11px;"></i>' : '') +
+                    '</div>' +
+                    '<div class="result-meta">' + escapeHtml(sender) + ' • ' + date + ' ' + time + '</div>' +
+                    '<div class="result-preview">' + escapeHtml(email.bodyPreview || '') + '</div>' +
+                '</div>' +
+                '<div class="result-check"><i class="fas fa-check-circle"></i></div>' +
+            '</div>';
+    });
+    
+    resultsDiv.innerHTML = html;
+}
+
+function renderFileResults(files) {
+    var resultsDiv = document.getElementById('m365-results');
+    if (!resultsDiv) return;
+    
+    var html = '';
+    
+    files.forEach(function(file) {
+        var date = new Date(file.createdDateTime || file.lastModifiedDateTime).toLocaleDateString();
+        var size = formatFileSize(file.size);
+        var downloadUrl = file['@microsoft.graph.downloadUrl'] || file['@content.downloadUrl'] || '';
+        var name = file.name || 'Unknown File';
+        var iconClass = getFileIconClass(name);
+        
+        html += 
+            '<div class="search-result" ' +
+                'data-type="file" ' +
+                'data-name="' + escapeHtml(name) + '" ' +
+                'data-download-url="' + escapeHtml(downloadUrl) + '" ' +
+                'data-web-url="' + escapeHtml(file.webUrl || '') + '" ' +
+                'onclick="toggleFileSelection(this)">' +
+                '<div class="result-icon file"><i class="fas ' + iconClass + '"></i></div>' +
+                '<div class="result-content">' +
+                    '<div class="result-title"><span class="truncate">' + escapeHtml(name) + '</span></div>' +
+                    '<div class="result-meta">' + size + ' • ' + date + '</div>' +
+                '</div>' +
+                '<div class="result-check"><i class="fas fa-check-circle"></i></div>' +
+            '</div>';
+    });
+    
+    resultsDiv.innerHTML = html;
+}
+
+async function toggleEmailSelection(element, emailId) {
+    var existingIndex = selectedM365Items.findIndex(function(item) { return item.id === emailId; });
+    
+    if (existingIndex >= 0) {
+        selectedM365Items.splice(existingIndex, 1);
+        element.classList.remove('selected');
+        updateSelectedCount();
+        return;
+    }
+    
+    element.style.opacity = '0.5';
+    
+    try {
+        var response = await fetch('/api/get-email-content/' + emailId);
+        var emailData = await response.json();
+        
+        if (emailData.error) {
+            addMessage('Failed to get email: ' + emailData.error, 'system-error');
+            element.style.opacity = '1';
+            return;
+        }
+        
+        var sender = emailData.from?.emailAddress?.name || emailData.from?.emailAddress?.address || 'Unknown';
+        var senderEmail = emailData.from?.emailAddress?.address || '';
+        var toRecipients = (emailData.toRecipients || []).map(function(r) { return r.emailAddress?.address || r.emailAddress?.name; }).join(', ');
+        var ccRecipients = (emailData.ccRecipients || []).map(function(r) { return r.emailAddress?.address || r.emailAddress?.name; }).join(', ');
+        var subject = emailData.subject || 'No Subject';
+        var date = new Date(emailData.receivedDateTime).toLocaleString();
+        
+        var bodyText = '';
+        if (emailData.body) {
+            if (emailData.body.contentType === 'html') {
+                var temp = document.createElement('div');
+                temp.innerHTML = emailData.body.content;
+                bodyText = temp.textContent || temp.innerText || '';
+            } else {
+                bodyText = emailData.body.content || '';
+            }
+        }
+        
+        var emailItem = {
+            type: 'email',
+            id: emailId,
+            subject: subject,
+            from: sender + ' <' + senderEmail + '>',
+            to: toRecipients,
+            cc: ccRecipients,
+            date: date,
+            body: bodyText.trim(),
+            hasAttachments: emailData.hasAttachments
         };
+        
+        selectedM365Items.push(emailItem);
+        
+        if (emailData.hasAttachments) {
+            try {
+                var attResponse = await fetch('/api/search-outlook/' + emailId + '/attachments');
+                var attData = await attResponse.json();
+                
+                if (!attData.error && attData.value) {
+                    var validAttachments = attData.value.filter(function(a) { return a['@odata.type'] === '#microsoft.graph.fileAttachment'; });
+                    
+                    validAttachments.forEach(function(att) {
+                        selectedM365Items.push({
+                            type: 'email-attachment',
+                            id: emailId + '-' + att.id,
+                            emailId: emailId,
+                            name: att.name,
+                            contentBytes: att.contentBytes,
+                            contentType: att.contentType,
+                            parentSubject: subject
+                        });
+                    });
+                }
+            } catch (e) {
+                console.error('Failed to fetch attachments:', e);
+            }
+        }
+        
+        element.classList.add('selected');
+        
+    } catch (error) {
+        addMessage('Failed to get email: ' + error.message, 'system-error');
+    }
+    
+    element.style.opacity = '1';
+    updateSelectedCount();
+}
 
-        console.log("Sending request to /history/generate (or /conversation):", JSON.stringify(requestBody, null, 2)); // Log the request
+function toggleFileSelection(element) {
+    var downloadUrl = element.dataset.downloadUrl;
+    var name = element.dataset.name;
+    
+    if (!downloadUrl) {
+        addMessage('This file cannot be downloaded directly.', 'system-error');
+        return;
+    }
+    
+    var existingIndex = selectedM365Items.findIndex(function(item) { return item.name === name && item.type === 'onedrive-file'; });
+    
+    if (existingIndex >= 0) {
+        selectedM365Items.splice(existingIndex, 1);
+        element.classList.remove('selected');
+    } else {
+        selectedM365Items.push({
+            type: 'onedrive-file',
+            name: name,
+            downloadUrl: downloadUrl
+        });
+        element.classList.add('selected');
+    }
+    
+    updateSelectedCount();
+}
+
+function updateSelectedCount() {
+    var actionsBar = document.getElementById('m365-actions');
+    var countSpan = document.getElementById('selected-count');
+    
+    if (!actionsBar || !countSpan) return;
+    
+    var emailCount = selectedM365Items.filter(function(i) { return i.type === 'email'; }).length;
+    var fileCount = selectedM365Items.filter(function(i) { return i.type === 'onedrive-file' || i.type === 'email-attachment' || i.type === 'box-file'; }).length;
+    var calendarCount = selectedM365Items.filter(function(i) { return i.type === 'calendar'; }).length;
+    
+    if (selectedM365Items.length > 0) {
+        actionsBar.classList.remove('hidden');
+        var text = [];
+        if (emailCount > 0) text.push(emailCount + ' email' + (emailCount > 1 ? 's' : ''));
+        if (fileCount > 0) text.push(fileCount + ' file' + (fileCount > 1 ? 's' : ''));
+        if (calendarCount > 0) text.push(calendarCount + ' event' + (calendarCount > 1 ? 's' : ''));
+        countSpan.textContent = text.join(', ') + ' selected';
+    } else {
+        actionsBar.classList.add('hidden');
+    }
+}
+
+async function addSelectedToChat() {
+    if (selectedM365Items.length === 0) return;
+    
+    var statusId = addLoading('Importing selected items...');
+    
+    var emails = selectedM365Items.filter(function(i) { return i.type === 'email'; });
+    var files = selectedM365Items.filter(function(i) { return i.type === 'onedrive-file' || i.type === 'email-attachment'; });
+    var boxFiles = selectedM365Items.filter(function(i) { return i.type === 'box-file'; });
+    var calendarEvents = selectedM365Items.filter(function(i) { return i.type === 'calendar'; });
+    
+    // Add emails
+    for (var j = 0; j < emails.length; j++) {
+        var email = emails[j];
+        selectedEmails.push({
+            subject: email.subject,
+            from: email.from,
+            to: email.to,
+            date: email.date,
+            body: email.body
+        });
+    }
+    
+    // Add calendar events
+    for (var k = 0; k < calendarEvents.length; k++) {
+        var event = calendarEvents[k];
+        selectedCalendarEvents.push({
+            subject: event.subject,
+            start: event.start,
+            end: event.end,
+            location: event.location,
+            body: event.body
+        });
+    }
+    
+    // Download OneDrive/email attachment files (PDF only)
+    for (var m = 0; m < files.length; m++) {
+        var item = files[m];
+        var ext = (item.name || '').split('.').pop().toLowerCase();
+        if (ext !== 'pdf' && ext !== 'docx') {
+            addMessage('File "' + (item.name || '') + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
+            continue;
+        }
+        try {
+            if (item.type === 'email-attachment') {
+                var response = await fetch('/api/get-upload-url', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: item.name }),
+                    credentials: 'same-origin'
+                });
+                
+                var urlData = await parseJsonResponse(response, 'get-upload-url');
+                if (urlData.error) throw new Error(urlData.error);
+                
+                var binaryData = atob(item.contentBytes);
+                var bytes = new Uint8Array(binaryData.length);
+                for (var n = 0; n < binaryData.length; n++) {
+                    bytes[n] = binaryData.charCodeAt(n);
+                }
+                
+                var uploadResponse = await fetch(urlData.upload_url, {
+                    method: 'PUT',
+                    headers: {
+                        'x-ms-blob-type': 'BlockBlob',
+                        'Content-Type': item.contentType || 'application/octet-stream'
+                    },
+                    body: bytes
+                });
+                
+                if (!uploadResponse.ok) throw new Error('Upload failed');
+                
+                var regResp = await fetch('/api/register-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_name: urlData.blob_name, original_filename: item.name }),
+                    credentials: 'same-origin'
+                });
+                var regD = await parseJsonResponse(regResp, 'register-attachment');
+                if (regD.error || !regD.job_id) throw new Error(regD.error || 'Attachment registration failed');
+                attachedFiles.push({
+                    blob_name: urlData.blob_name,
+                    original_filename: item.name,
+                    source: 'outlook',
+                    job_id: regD.job_id,
+                    status: regD.status || 'pending'
+                });
+                if (regD.job_id && (regD.status === 'pending' || regD.status === 'processing')) {
+                    startAttachmentJobPolling(regD.job_id);
+                }
+            } else if (item.type === 'onedrive-file') {
+                var response2 = await fetch('/api/download-graph-file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        download_url: item.downloadUrl,
+                        file_name: item.name
+                    }),
+                    credentials: 'same-origin'
+                });
+                
+                var data = await parseJsonResponse(response2, 'download-graph-file');
+                if (data.error) throw new Error(data.error);
+                var regOd = await fetch('/api/register-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_name: data.blob_name, original_filename: data.original_filename }),
+                    credentials: 'same-origin'
+                });
+                var regOdData = await parseJsonResponse(regOd, 'register-attachment');
+                if (regOdData.error || !regOdData.job_id) throw new Error(regOdData.error || 'Attachment registration failed');
+                attachedFiles.push({
+                    blob_name: data.blob_name,
+                    original_filename: data.original_filename,
+                    source: 'onedrive',
+                    job_id: regOdData.job_id,
+                    status: regOdData.status || 'pending'
+                });
+                if (regOdData.job_id && (regOdData.status === 'pending' || regOdData.status === 'processing')) {
+                    startAttachmentJobPolling(regOdData.job_id);
+                }
+            }
+        } catch (error) {
+            console.error('Failed to import ' + item.name + ':', error);
+            addMessage('Failed to import "' + (item.name || '') + '": ' + error.message, 'system-error');
+        }
+    }
+    
+    // Download Box files (apenas PDF)
+    for (var b = 0; b < boxFiles.length; b++) {
+        var boxFile = boxFiles[b];
+        var boxExt = (boxFile.name || '').split('.').pop().toLowerCase();
+        if (boxExt !== 'pdf' && boxExt !== 'docx') {
+            addMessage('File "' + (boxFile.name || '') + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
+            continue;
+        }
+        try {
+            var boxResponse = await fetch('/api/box/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    file_id: boxFile.id,
+                    file_name: boxFile.name
+                }),
+                credentials: 'same-origin'
+            });
+            
+            var boxData = await parseJsonResponse(boxResponse, 'box/download');
+            if (boxData.error) throw new Error(boxData.error);
+            var regBox = await fetch('/api/register-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ blob_name: boxData.blob_name, original_filename: boxData.original_filename }),
+                credentials: 'same-origin'
+            });
+            var regBoxData = await parseJsonResponse(regBox, 'register-attachment');
+            if (regBoxData.error || !regBoxData.job_id) throw new Error(regBoxData.error || 'Attachment registration failed');
+            attachedFiles.push({
+                blob_name: boxData.blob_name,
+                original_filename: boxData.original_filename,
+                source: 'box',
+                job_id: regBoxData.job_id,
+                status: regBoxData.status || 'pending'
+            });
+            if (regBoxData.job_id && (regBoxData.status === 'pending' || regBoxData.status === 'processing')) {
+                startAttachmentJobPolling(regBoxData.job_id);
+            }
+        } catch (error) {
+            console.error('Failed to import Box file ' + boxFile.name + ':', error);
+            addMessage('Failed to import Box file "' + (boxFile.name || '') + '": ' + error.message, 'system-error');
+        }
+    }
+    
+    removeMessage(statusId);
+    updateAttachmentsUI();
+    closeM365Panel();
+    
+    var importMsg = '✅ Imported: ';
+    var parts = [];
+    if (emails.length > 0) parts.push(emails.length + ' email' + (emails.length > 1 ? 's' : ''));
+    if (files.length + boxFiles.length > 0) parts.push((files.length + boxFiles.length) + ' file' + ((files.length + boxFiles.length) > 1 ? 's' : ''));
+    if (calendarEvents.length > 0) parts.push(calendarEvents.length + ' calendar event' + (calendarEvents.length > 1 ? 's' : ''));
+    importMsg += parts.join(' and ');
+    importMsg += '. You can now ask questions about them.';
+    
+    if (parts.length > 0) {
+        addMessage(importMsg, 'system');
+    }
+}
+
+// --- FILE ATTACHMENT HANDLING ---
+
+async function handleFileSelect(event) {
+    var files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    for (var i = 0; i < files.length; i++) {
+        var file = files[i];
+        var ext = (file.name || '').split('.').pop().toLowerCase();
+        if (ext !== 'pdf' && ext !== 'docx') {
+            addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
+            continue;
+        }
+        if (file.size > 50 * 1024 * 1024) {
+            addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
+            continue;
+        }
+
+        var statusId = addLoading('Uploading ' + file.name + '...');
 
         try {
-            // Call your backend API endpoint. 
-            // The original app uses /history/generate to *start* or *continue* a conversation (it includes the call to conversation_internal)
-            // Let's use that, as it handles history creation.
-            const response = await fetch('/history/generate', { 
+            var urlResponse = await fetch('/api/get-upload-url', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(requestBody)
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name }),
+                credentials: 'same-origin'
             });
 
-            hideTypingIndicator();
+            var urlData = await parseJsonResponse(urlResponse, 'get-upload-url');
+            if (urlData.error) throw new Error(urlData.error);
 
-            if (!response.ok) {
-                // Display error message from backend if possible
-                let errorText = `HTTP error! status: ${response.status}`;
-                try {
-                    const errorData = await response.json();
-                    errorText = errorData.error || response.statusText;
-                } catch (e) {
-                    console.error("Could not parse error response JSON:", e);
-                }
-                displayMessage(`Error: ${errorText}`, 'bot');
-                console.error("API Error:", response.status, errorText);
-                messageHistory.pop(); // Remove user message from history if API call failed
+            var uploadResponse = await fetch(urlData.upload_url, {
+                method: 'PUT',
+                headers: {
+                    'x-ms-blob-type': 'BlockBlob',
+                    'Content-Type': file.type || 'application/octet-stream'
+                },
+                body: file
+            });
+
+            if (!uploadResponse.ok) throw new Error('Upload failed');
+
+            var regResponse = await fetch('/api/register-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    blob_name: urlData.blob_name,
+                    original_filename: file.name
+                }),
+                credentials: 'same-origin'
+            });
+            var regData = await parseJsonResponse(regResponse, 'register-attachment').catch(function(e) {
+                return { error: e.message };
+            });
+            if (!regResponse.ok || !regData.job_id) {
+                removeMessage(statusId);
+                addMessage(regData.error || 'File uploaded but background processing failed. Please try again.', 'system-error');
                 return;
             }
+            var jobId = regData.job_id;
+            var jobStatus = regData.status || 'pending';
 
-            // Handle the response from the backend
-            const responseData = await response.json();
-            console.log("Received response from backend:", responseData); // Log the response
+            attachedFiles.push({
+                blob_name: urlData.blob_name,
+                original_filename: file.name,
+                size: file.size,
+                source: 'local',
+                job_id: jobId,
+                status: jobStatus
+            });
 
-            // Assuming responseData structure based on the Python backend:
-            // { id: "...", choices: [ { message: { role: "assistant", content: "...", context: { citations: [...] } } } ], ... }
-            let botText = "Sorry, I couldn't get a valid response.";
-            let sources = [];
-            let responseMessageId = Date.now().toString(); // Use timestamp as fallback ID
-            let botMessage = {};
-
-            if (responseData.choices && responseData.choices.length > 0 && responseData.choices[0].message) {
-               const message = responseData.choices[0].message;
-               botText = message.content || botText;
-               responseMessageId = responseData.id || responseMessageId; // Use ID from response if available
-
-               // Add bot response to local history
-               botMessage = { role: 'assistant', content: botText, id: responseMessageId };
-               
-               // Extract sources if backend provides them in the expected format
-               if (message.context && message.context.citations) {
-                   sources = message.context.citations.map(cit => ({
-                       title: cit.title || cit.filepath || cit.url || 'Unknown Source', // Adjust based on backend format
-                       url: cit.url || '#'
-                   }));
-                   // Add context to bot message for history (if needed, though backend might re-add)
-                   botMessage.context = message.context;
-               }
-            } else if (responseData.error) {
-                 botText = `Error from backend: ${responseData.error}`;
-                 botMessage = { role: 'assistant', content: botText, id: responseMessageId };
+            updateAttachmentsUI();
+            if (jobStatus === 'pending' || jobStatus === 'processing') {
+                startAttachmentJobPolling(jobId);
             }
-            
-            messageHistory.push(botMessage); // Add bot's response to history
-            
-            // Update conversation ID if it was just created
-            if (responseData.history_metadata && responseData.history_metadata.conversation_id) {
-                currentConversationId = responseData.history_metadata.conversation_id;
-                console.log("Started new conversation, ID:", currentConversationId);
-            }
-
-            displayMessage({ id: responseMessageId, text: botText, sources: sources }, 'bot'); // Display response with sources
+            removeMessage(statusId);
 
         } catch (error) {
-            hideTypingIndicator();
-            const errorText = `Error calling backend: ${error.message}`;
-            displayMessage(errorText, 'bot');
-            console.error('Fetch Error:', error);
-            messageHistory.pop(); // Remove user message from history if fetch failed
+            removeMessage(statusId);
+            addMessage('Failed to upload "' + file.name + '": ' + error.message, 'system-error');
         }
     }
-}
-// *** END UPDATED sendMessage Function ***
 
-// Enhanced displayMessage function
-function displayMessage(data, type) {
-    const messageDiv = document.createElement('div');
-    messageDiv.classList.add('message', type);
-    // Use ID from data if available (for assistant messages), otherwise generate one
-    const messageId = (type === 'bot' && data.id) ? data.id : Date.now();
-    messageDiv.dataset.messageId = messageId; // Set data-message-id attribute
-
-    const contentDiv = document.createElement('div');
-    contentDiv.classList.add('message-content');
-
-    let messageText = '';
-    let sources = [];
-
-    // Check if data is an object with text and sources, or just text
-    if (typeof data === 'object' && data !== null && data.text) {
-        messageText = data.text;
-        sources = data.sources || []; // Get sources array, default to empty
-    } else if (typeof data === 'string') {
-        messageText = data;
-    } else {
-        messageText = "Received unexpected data format."; // Fallback
-    }
-
-    // Basic markdown support + link inline citations to source list below
-    // Escape HTML potentially in messageText before adding markdown
-    const escapedText = messageText.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    contentDiv.innerHTML = escapedText
-        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // Bold
-        .replace(/\*(.*?)\*/g, '<em>$1</em>')       // Italics
-        .replace(/\[(\d+)\]/g, `<a href="#source-$1-${messageId}" onclick="scrollToSource('source-$1-${messageId}')" class="citation-marker">[$1]</a>`); // Link to source ID
-
-
-    // Add sources section if sources exist
-    if (type === 'bot' && sources.length > 0) {
-        const sourcesDiv = document.createElement('div');
-        sourcesDiv.classList.add('message-sources');
-        let sourcesListHtml = '<small>Sources:</small><ol>';
-        sources.forEach((source, index) => {
-            // Assume source is an object like { url: "...", title: "..." }
-            const sourceNum = index + 1;
-            // Escape title to prevent XSS
-            const title = (source.title || source.url || `Source ${sourceNum}`).replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            const url = source.url || '#';
-            // Add ID to list item for linking
-            sourcesListHtml += `<li id="source-${sourceNum}-${messageId}"><a href="${url}" target="_blank" title="${title}"> ${title}</a></li>`;
-        });
-        sourcesListHtml += '</ol>';
-        sourcesDiv.innerHTML = sourcesListHtml;
-        contentDiv.appendChild(sourcesDiv); // Append sources inside the content bubble
-    }
-
-    messageDiv.appendChild(contentDiv);
-
-    // Add action buttons for bot messages
-    if (type === 'bot' && !messageText.startsWith("Error:")) { // Don't add actions to error messages
-        const actionsDiv = document.createElement('div');
-        actionsDiv.classList.add('message-actions');
-        actionsDiv.innerHTML = `
-            <button class="action-btn copy-btn" title="Copy"><i class="far fa-copy"></i></button>
-            <button class="action-btn feedback-btn good" title="Good response"><i class="far fa-thumbs-up"></i></button>
-            <button class="action-btn feedback-btn bad" title="Bad response"><i class="far fa-thumbs-down"></i></button>
-        `;
-        messageDiv.appendChild(actionsDiv);
-    }
-
-    // Insert message
-    if (typingIndicator && typingIndicator.parentNode === chatMessages) {
-        chatMessages.insertBefore(messageDiv, typingIndicator);
-    } else {
-        chatMessages.appendChild(messageDiv);
-    }
-
-    scrollToBottom(false); // Don't use smooth scroll initially if many messages load
-    // Use smooth scroll after a slight delay to ensure layout is complete
-    setTimeout(() => scrollToBottom(true), 50);
+    event.target.value = '';
 }
 
-
-// --- Typing Indicator ---
-function initializeTypingIndicator() {
-    typingIndicator = document.createElement('div');
-    typingIndicator.classList.add('message', 'bot', 'typing-indicator');
-    typingIndicator.innerHTML = `<div class="message-content"><span>.</span><span>.</span><span>.</span></div>`;
-    typingIndicator.style.display = 'none'; // Initially hidden
-    chatMessages.appendChild(typingIndicator);
-}
-
-function showTypingIndicator() {
-    if (typingIndicator) {
-        typingIndicator.style.display = 'flex'; // Use flex for alignment
-        scrollToBottom(true);
+function stopAttachmentJobPolling(jobId) {
+    if (attachmentJobPollers[jobId]) {
+        clearInterval(attachmentJobPollers[jobId]);
+        delete attachmentJobPollers[jobId];
     }
 }
 
-function hideTypingIndicator() {
-    if (typingIndicator) {
-        typingIndicator.style.display = 'none';
-    }
+function startAttachmentJobPolling(jobId) {
+    if (!jobId || attachmentJobPollers[jobId]) return;
+    var interval = 2000;
+    attachmentJobPollers[jobId] = setInterval(async function() {
+        try {
+            var r = await fetch('/api/jobs/' + jobId, { credentials: 'same-origin' });
+            if (!r.ok) return;
+            var data = await r.json();
+            var st = (data.status || '').toLowerCase();
+            if (st === 'completed' || st === 'failed') {
+                stopAttachmentJobPolling(jobId);
+                var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
+                if (f) {
+                    f.status = st;
+                    updateAttachmentsUI();
+                }
+            }
+        } catch (e) {
+            console.warn('Attachment job poll error:', e);
+        }
+    }, interval);
 }
 
-// --- Input Area Helpers ---
-function adjustInputHeight() {
-    userInput.style.height = 'auto'; // Reset height to recalculate scrollHeight
-    let newHeight = userInput.scrollHeight;
-    // Consider max-height defined in CSS
-    const maxHeight = parseInt(window.getComputedStyle(userInput).maxHeight, 10);
-    if (maxHeight && newHeight > maxHeight) {
-        newHeight = maxHeight;
-        userInput.style.overflowY = 'auto'; // Show scrollbar if max height reached
-    } else {
-        userInput.style.overflowY = 'hidden'; // Hide scrollbar if not needed
-    }
-    // Add a small buffer only if not at max height to prevent scrollbar flicker
-    const buffer = (newHeight < maxHeight) ? 2 : 0;
-    userInput.style.height = (newHeight + buffer) + 'px';
+function hasProcessingAttachments() {
+    return attachedFiles.some(function(f) {
+        var s = (f.status || '').toLowerCase();
+        return s === 'pending' || s === 'processing';
+    });
 }
-
 
 function updateSendButtonState() {
-    sendButton.disabled = userInput.value.trim() === '';
-}
-
-function scrollToBottom(smooth = true) {
-    // Scroll smoothly to the bottom
-    chatMessages.scrollTo({
-        top: chatMessages.scrollHeight,
-        behavior: smooth ? 'smooth' : 'auto'
-    });
-}
-
-// Helper function to scroll to a specific source when citation is clicked
-function scrollToSource(sourceId) {
-    const sourceElement = document.getElementById(sourceId);
-    if (sourceElement) {
-        sourceElement.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        // Optional: Add a temporary highlight effect
-        sourceElement.style.transition = 'background-color 0.5s ease';
-        sourceElement.style.backgroundColor = 'rgba(0, 90, 156, 0.1)'; // Light blue highlight
-        setTimeout(() => {
-            sourceElement.style.backgroundColor = ''; // Remove highlight
-        }, 1500);
+    var btn = document.getElementById('btn-send');
+    var warning = document.getElementById('processing-warning');
+    var processing = hasProcessingAttachments();
+    if (btn) {
+        btn.disabled = processing;
+        btn.title = processing ? 'Wait for documents to finish processing before sending' : 'Send message';
+    }
+    if (warning) {
+        warning.classList.toggle('hidden', !processing);
     }
 }
 
-// --- Action Button Handlers ---
-function copyMessageToClipboard(messageDiv) {
-    // Try to copy only the main text, excluding sources if present
-    let textToCopy = '';
-    const contentDiv = messageDiv.querySelector('.message-content');
-    if (!contentDiv) return;
+function updateAttachmentsUI() {
+    var preview = document.getElementById('attachments-preview');
+    var list = document.getElementById('attachments-list');
+    var count = document.getElementById('attachment-count');
 
-    const contentChildren = Array.from(contentDiv.childNodes);
-    contentChildren.forEach(node => {
-        if (node.nodeType === Node.TEXT_NODE) {
-            textToCopy += node.textContent;
-        } else if (node.nodeType === Node.ELEMENT_NODE && !node.classList.contains('message-sources')) {
-            // Include text from elements like <strong> or <em>, but skip the sources div
-             textToCopy += node.textContent || node.innerText; // Handle potential differences
-        }
-    });
-     textToCopy = textToCopy.trim(); // Clean up extra whitespace
+    if (!preview || !list || !count) return;
 
-    if (textToCopy && navigator.clipboard) { // Check if clipboard API is available
-        navigator.clipboard.writeText(textToCopy)
-            .then(() => {
-                const copyBtn = messageDiv.querySelector('.copy-btn');
-                if (copyBtn) {
-                   const originalIcon = copyBtn.innerHTML;
-                   copyBtn.innerHTML = '<i class="fas fa-check"></i>'; // Checkmark
-                   copyBtn.disabled = true; // Briefly disable
-                   setTimeout(() => {
-                       copyBtn.innerHTML = originalIcon;
-                       copyBtn.disabled = false;
-                    }, 1500);
-                }
-            })
-            .catch(err => {
-                console.error('Failed to copy text: ', err);
-                alert('Failed to copy text.'); // Simple error feedback
-            });
-    } else if (!navigator.clipboard) {
-         console.warn("Clipboard API not available.");
-         alert("Copying to clipboard is not supported in this browser or context.");
-    } else {
-         console.warn("No text content found to copy, excluding sources.");
-    }
-}
-
-async function handleFeedback(button) {
-    const messageDiv = button.closest('.message.bot');
-    if (!messageDiv || !messageDiv.dataset.messageId) {
-        console.error("Feedback button clicked, but message ID not found.");
+    var totalItems = attachedFiles.length + selectedEmails.length + selectedCalendarEvents.length;
+    
+    if (totalItems === 0) {
+        preview.classList.add('hidden');
+        count.classList.add('hidden');
+        updateSendButtonState();
         return;
     }
 
-    const messageId = messageDiv.dataset.messageId;
-    // Map feedback to "like" or "dislike" as expected by the backend
-    const feedbackType = button.classList.contains('good') ? 'like' : 'dislike';
-    console.log(`Feedback received: ${feedbackType} for message ${messageId}`); // Placeholder
+    preview.classList.remove('hidden');
+    count.classList.remove('hidden');
+    count.textContent = totalItems;
+    updateSendButtonState();
 
-    // --- Send feedback (messageId, feedbackType) to the backend ---
-    try {
-         // Use the correct backend route /history/message_feedback
-         const response = await fetch('/history/message_feedback', { 
-             method: 'POST',
-             headers: {
-                 'Content-Type': 'application/json'
-             },
-             body: JSON.stringify({
-                 message_id: messageId,
-                 message_feedback: feedbackType
-             })
-         });
-
-         if (!response.ok) {
-             const errorData = await response.json().catch(() => ({}));
-             console.error(`Failed to submit feedback: ${response.status}`, errorData);
-             alert(`Failed to submit feedback: ${errorData.error || response.statusText}`);
-             return; // Don't disable buttons if feedback failed
-         }
-
-         // Visual feedback: Highlight selected, disable others ONLY on success
-         const actionsDiv = button.closest('.message-actions');
-         const feedbackButtons = actionsDiv.querySelectorAll('.feedback-btn');
-         feedbackButtons.forEach(btn => {
-             btn.disabled = true; // Disable all feedback buttons
-             btn.style.opacity = '0.5'; // Dim disabled buttons
-             btn.style.cursor = 'default';
-         });
-         // Highlight the clicked one
-         button.style.opacity = '1';
-         button.style.color = feedbackType === 'like' ? '#198754' : '#dc3545'; // Green for good, Red for bad
-
-     } catch (error) {
-         console.error('Error sending feedback:', error);
-         alert(`Error sending feedback: ${error.message}`);
-     }
+    var html = '';
+    
+    selectedEmails.forEach(function(email, index) {
+        html += 
+            '<div class="attachment-chip">' +
+                '<i class="fas fa-envelope" style="color: var(--primary-500);"></i>' +
+                '<span class="name" title="' + escapeHtml(email.subject) + '">' + escapeHtml(email.subject) + '</span>' +
+                '<span class="remove" onclick="removeEmail(' + index + ')"><i class="fas fa-times"></i></span>' +
+            '</div>';
+    });
+    
+    selectedCalendarEvents.forEach(function(event, index) {
+        html += 
+            '<div class="attachment-chip">' +
+                '<i class="fas fa-calendar" style="color: #8b5cf6;"></i>' +
+                '<span class="name" title="' + escapeHtml(event.subject) + '">' + escapeHtml(event.subject) + '</span>' +
+                '<span class="remove" onclick="removeCalendarEvent(' + index + ')"><i class="fas fa-times"></i></span>' +
+            '</div>';
+    });
+    
+    attachedFiles.forEach(function(file, index) {
+        var iconColor = file.source === 'outlook' ? 'var(--primary-500)' : file.source === 'onedrive' ? '#0ea5e9' : file.source === 'box' ? '#0061d5' : 'var(--gray-500)';
+        var statusHint = (file.status === 'pending' || file.status === 'processing') ? ' <span class="processing-badge"><i class="fas fa-spinner fa-spin"></i> Processing</span>' : (file.status === 'completed' ? ' <span class="ready-badge"><i class="fas fa-check-circle"></i></span>' : '');
+        html += 
+            '<div class="attachment-chip">' +
+                '<i class="fas ' + getFileIcon(file.original_filename) + '" style="color: ' + iconColor + ';"></i>' +
+                '<span class="name">' + escapeHtml(file.original_filename) + statusHint + '</span>' +
+                '<span class="remove" onclick="removeAttachment(' + index + ')"><i class="fas fa-times"></i></span>' +
+            '</div>';
+    });
+    
+    list.innerHTML = html;
 }
+
+function getFileIcon(filename) {
+    var ext = filename.split('.').pop().toLowerCase();
+    var icons = {
+        'pdf': 'fa-file-pdf',
+        'doc': 'fa-file-word',
+        'docx': 'fa-file-word',
+        'txt': 'fa-file-lines',
+        'png': 'fa-file-image',
+        'jpg': 'fa-file-image',
+        'jpeg': 'fa-file-image',
+        'xls': 'fa-file-excel',
+        'xlsx': 'fa-file-excel'
+    };
+    return icons[ext] || 'fa-file';
+}
+
+function getFileIconClass(filename) {
+    return getFileIcon(filename);
+}
+
+async function removeAttachment(index) {
+    var file = attachedFiles[index];
+    if (file) {
+        if (file.job_id) stopAttachmentJobPolling(file.job_id);
+        if (file.blob_name) {
+        try {
+            await fetch('/api/delete-attachment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ blob_name: file.blob_name }),
+                credentials: 'same-origin'
+            });
+        } catch (e) {
+            console.warn('Failed to delete blob on server:', e);
+        }
+        }
+    }
+    attachedFiles.splice(index, 1);
+    updateAttachmentsUI();
+}
+
+function removeEmail(index) {
+    selectedEmails.splice(index, 1);
+    updateAttachmentsUI();
+}
+
+function removeCalendarEvent(index) {
+    selectedCalendarEvents.splice(index, 1);
+    updateAttachmentsUI();
+}
+
+async function clearAllAttachments() {
+    attachedFiles.forEach(function(f) { if (f.job_id) stopAttachmentJobPolling(f.job_id); });
+    // Delete blobs from storage before clearing
+    if (attachedFiles.length > 0) {
+        var blobNames = attachedFiles.map(function(f) { return f.blob_name; }).filter(Boolean);
+        if (blobNames.length > 0) {
+            try {
+                await fetch('/api/delete-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ blob_names: blobNames }),
+                    credentials: 'same-origin'
+                });
+            } catch (e) {
+                console.warn('Failed to delete blobs on clear:', e);
+            }
+        }
+    }
+    attachedFiles = [];
+    selectedEmails = [];
+    selectedCalendarEvents = [];
+    updateAttachmentsUI();
+}
+
+function startNewConversation() {
+    messageHistory = [];
+    clearAllAttachments();
+}
+
+// --- CHAT FUNCTIONS ---
+
+async function sendMessage() {
+    var input = document.getElementById('user-input');
+    if (!input) return;
+
+    if (hasProcessingAttachments()) {
+        addMessage('Please wait for documents to finish processing before sending.', 'system-error');
+        return;
+    }
+    
+    var message = input.value.trim();
+    
+    if (!message && attachedFiles.length === 0 && selectedEmails.length === 0 && selectedCalendarEvents.length === 0) return;
+
+    var displayMessage = message;
+    var attachments = [];
+    
+    if (selectedEmails.length > 0) attachments.push(selectedEmails.length + ' email' + (selectedEmails.length > 1 ? 's' : ''));
+    if (selectedCalendarEvents.length > 0) attachments.push(selectedCalendarEvents.length + ' event' + (selectedCalendarEvents.length > 1 ? 's' : ''));
+    if (attachedFiles.length > 0) attachments.push(attachedFiles.length + ' file' + (attachedFiles.length > 1 ? 's' : ''));
+    
+    if (attachments.length > 0) {
+        displayMessage = message 
+            ? '📎 ' + attachments.join(', ') + '\n\n' + message
+            : '📎 Attached: ' + attachments.join(', ');
+    }
+
+    addMessage(displayMessage, 'user');
+    input.value = '';
+
+    // Add user message to history (raw content for backend)
+    var userContent = message || 'Please analyze the attached content.';
+    messageHistory.push({ role: 'user', content: userContent });
+
+    // Get jurisdiction
+    var jurisdictionSelect = document.getElementById('jurisdiction');
+    var jurisdiction = jurisdictionSelect ? jurisdictionSelect.value : 'California';
+
+    // Free mode: no RAG, no tools (ChatGPT-like)
+    var freeMode = document.getElementById('free-mode-toggle') ? document.getElementById('free-mode-toggle').checked : false;
+    var blobsToSend = freeMode ? [] : attachedFiles;
+    var emailsToSend = freeMode ? [] : selectedEmails;
+    var calendarToSend = freeMode ? [] : selectedCalendarEvents;
+    if (freeMode && (attachedFiles.length > 0 || selectedEmails.length > 0 || selectedCalendarEvents.length > 0)) {
+        addMessage('Modo Free: anexos não são utilizados nesta mensagem.', 'system');
+    }
+
+    // Add agentic status indicator
+    var statusId = addAgenticStatus();
+    updateAgenticStatus(statusId, 'Searching legal sources...', true);
+
+    try {
+        var response = await fetch('/api/agentic/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                query: userContent,
+                jurisdiction: jurisdiction,
+                messages: messageHistory,
+                blobs: blobsToSend,
+                emails: emailsToSend,
+                calendar_events: calendarToSend,
+                free_mode: freeMode
+            }),
+            credentials: 'same-origin'
+        });
+
+        if (!response.ok) {
+            var errData = await response.json().catch(function() { return { detail: response.statusText }; });
+            removeMessage(statusId);
+            addMessage('Error: ' + (errData.detail || errData.error || response.statusText), 'system-error');
+            messageHistory.pop();
+            return;
+        }
+
+        if (!response.body) {
+            removeMessage(statusId);
+            addMessage('Streaming not supported.', 'system-error');
+            messageHistory.pop();
+            return;
+        }
+
+        removeMessage(statusId);
+        var streamingBubble = addStreamingMessageBubble();
+
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        var fullText = '';
+        var receivedDone = false;
+
+        while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            buffer += decoder.decode(result.value, { stream: true });
+            var lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+                if (line.startsWith('data: ')) {
+                    try {
+                        var ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'token') {
+                            fullText += ev.content || '';
+                            updateStreamingBubble(streamingBubble, fullText, false);
+                        } else if (ev.type === 'done') {
+                            receivedDone = ev.complete === true;
+                        } else if (ev.type === 'error') {
+                            fullText += '\n\n[Erro: ' + (ev.message || 'unknown') + ']';
+                        }
+                    } catch (e) { /* ignore parse errors */ }
+                }
+            }
+        }
+
+        updateStreamingBubble(streamingBubble, fullText, true);
+        if (!receivedDone && fullText) {
+            addMessage('Aviso: A resposta pode estar incompleta (conexão interrompida).', 'system');
+        }
+        messageHistory.push({ role: 'assistant', content: fullText });
+
+    } catch (error) {
+        removeMessage(statusId);
+        addMessage('Failed to connect to server: ' + error.message, 'system-error');
+        messageHistory.pop();
+    }
+}
+
+function addStreamingMessageBubble() {
+    var container = document.getElementById('chat-container');
+    if (!container) return null;
+    var div = document.createElement('div');
+    div.className = 'message message-system';
+    var bubble = document.createElement('div');
+    bubble.className = 'message-bubble prose-chat';
+    bubble.innerHTML = '<div style="display:flex;align-items:center;padding:4px 0;"><div class="loading-spinner"></div></div>';
+    div.appendChild(bubble);
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    return { div: div, bubble: bubble };
+}
+
+function updateStreamingBubble(streamingBubble, text, isComplete) {
+    if (!streamingBubble || !streamingBubble.bubble) return;
+    if (isComplete && text) {
+        streamingBubble.bubble.innerHTML = renderMarkdown(text);
+    } else if (isComplete && !text) {
+        streamingBubble.bubble.textContent = '...';
+    } else if (text) {
+        streamingBubble.bubble.textContent = text;
+    }
+    /* Se text estiver vazio e ainda não completou, mantém o spinner */
+    var container = document.getElementById('chat-container');
+    if (container) container.scrollTop = container.scrollHeight;
+}
+
+function addAgenticStatus() {
+    var container = document.getElementById('chat-container');
+    if (!container) return;
+    
+    var div = document.createElement('div');
+    div.className = 'message message-system';
+    div.innerHTML = 
+        '<div class="agentic-status">' +
+            '<div class="agentic-status-header">' +
+                '<div class="loading-spinner"></div>' +
+                '<span class="agentic-status-text">Planning search strategy...</span>' +
+            '</div>' +
+            '<div class="agentic-sources">' +
+                '<span class="agentic-source-badge" id="source-box"><i class="fas fa-box"></i> Box</span>' +
+                '<span class="agentic-source-badge" id="source-outlook"><i class="fas fa-envelope"></i> Outlook</span>' +
+                '<span class="agentic-source-badge" id="source-calendar"><i class="fas fa-calendar"></i> Calendar</span>' +
+            '</div>' +
+        '</div>';
+    div.id = 'agentic-status-' + Date.now();
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    return div.id;
+}
+
+function updateAgenticStatus(statusId, statusText, activeSource) {
+    var statusDiv = document.getElementById(statusId);
+    if (!statusDiv) return;
+    
+    var textEl = statusDiv.querySelector('.agentic-status-text');
+    if (textEl) {
+        textEl.textContent = statusText;
+    }
+    
+    // Update source badges
+    if (activeSource) {
+        var sourceMap = {
+            'box': 'source-box',
+            'outlook': 'source-outlook',
+            'emails': 'source-outlook',
+            'calendar': 'source-calendar'
+        };
+        
+        Object.keys(sourceMap).forEach(function(key) {
+            var badge = statusDiv.querySelector('#' + sourceMap[key]);
+            if (badge) {
+                if (statusText.toLowerCase().includes(key)) {
+                    badge.classList.add('active');
+                    badge.classList.remove('done');
+                } else if (badge.classList.contains('active')) {
+                    badge.classList.remove('active');
+                    badge.classList.add('done');
+                }
+            }
+        });
+    }
+}
+
+async function pollForResultWithStatus(jobId, statusId, maxAttempts, interval) {
+    maxAttempts = maxAttempts || 180;
+    interval = interval || 800;
+    
+    for (var i = 0; i < maxAttempts; i++) {
+        try {
+            var response = await fetch('/api/check_status/' + jobId, { credentials: 'same-origin' });
+            var data = await parseJsonResponse(response, 'status poll');
+            
+            // Update status display
+            if (data.status && data.status !== 'completed' && data.status !== 'Failed') {
+                updateAgenticStatus(statusId, data.status, true);
+            }
+            
+            if (data.status === 'completed' || data.status === 'Failed') {
+                return data;
+            }
+            
+            await new Promise(function(resolve) { setTimeout(resolve, interval); });
+        } catch (error) {
+            console.error('Polling error:', error);
+            return { status: 'Failed', result: 'Connection error: ' + error.message };
+        }
+    }
+    return { status: 'Timeout', result: 'Request timed out' };
+}
+
+async function pollForResult(jobId, maxAttempts, interval) {
+    maxAttempts = maxAttempts || 120;
+    interval = interval || 1000;
+    
+    for (var i = 0; i < maxAttempts; i++) {
+        try {
+            var response = await fetch('/api/check_status/' + jobId, { credentials: 'same-origin' });
+            var data = await parseJsonResponse(response, 'status poll');
+            
+            if (data.status === 'completed' || data.status === 'Failed') {
+                return data;
+            }
+            
+            await new Promise(function(resolve) { setTimeout(resolve, interval); });
+        } catch (error) {
+            console.error('Polling error:', error);
+        }
+    }
+    return { status: 'Timeout', result: 'Request timed out' };
+}
+
+function addMessage(text, type, isMarkdown) {
+    var container = document.getElementById('chat-container');
+    if (!container) return;
+    
+    var div = document.createElement('div');
+    
+    var messageClass = type === 'user' ? 'message-user' : type === 'system-error' ? 'message-system message-error' : 'message-system';
+    div.className = 'message ' + messageClass;
+    
+    var bubble = document.createElement('div');
+    bubble.className = 'message-bubble' + (isMarkdown && type !== 'user' ? ' prose-chat' : '');
+    
+    if (isMarkdown && type !== 'user') {
+        bubble.innerHTML = renderMarkdown(text);
+    } else {
+        bubble.textContent = text;
+    }
+    
+    div.appendChild(bubble);
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    div.id = 'msg-' + Date.now();
+    return div.id;
+}
+
+function renderMarkdown(text) {
+    if (!text) return '';
+    
+    // 1. HTML escape
+    var html = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    
+    // 2. Code blocks (preserve content)
+    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+    
+    // 3. Tables (GFM-style: header line, separator with dashes, body rows)
+    html = html.replace(/(?:^|\n)((?:\|[^\n]+\n)(?:\|[^\n]*\-[^\n]*\n)(?:(?:\|[^\n]+\n?)+))/g, function(match) {
+        var lines = match.trim().split('\n').filter(function(l) { return l.trim(); });
+        if (lines.length < 2) return match;
+        var headerCells = lines[0].split('|').slice(1, -1).map(function(c) { return c.trim(); });
+        var rows = lines.slice(2);
+        var thead = '<thead><tr>' + headerCells.map(function(c) { return '<th>' + c + '</th>'; }).join('') + '</tr></thead>';
+        var tbody = '<tbody>' + rows.map(function(row) {
+            var cells = row.split('|').slice(1, -1).map(function(c) { return c.trim(); });
+            return '<tr>' + cells.map(function(c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
+        }).join('') + '</tbody>';
+        return '<table class="prose-table">' + thead + tbody + '</table>';
+    });
+    
+    // 4. Headers
+    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+    
+    // 5. Bold and italic
+    html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
+    // HR
+    html = html.replace(/^---$/gm, '<hr>');
+    
+    // 6. Blockquotes
+    html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+    
+    // 7. Numbered lists
+    html = html.replace(/((?:^[\s]*\d+[.)]\s+.+$\n?)+)/gm, function(match) {
+        var items = match.trim().split(/\n/).map(function(line) {
+            var m = line.match(/^[\s]*\d+[.)]\s+(.+)$/);
+            return m ? '<li>' + m[1] + '</li>' : '';
+        }).filter(Boolean);
+        return items.length ? '<ol>' + items.join('') + '</ol>' : match;
+    });
+    
+    // 8. Bullet lists (support -, *, + ; no newlines in output)
+    html = html.replace(/^[\s]*[-*+] (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*?<\/li>(?:\n?))+/g, function(match) {
+        var items = match.match(/<li>[\s\S]*?<\/li>/g) || [];
+        return items.length ? '<ul>' + items.join('') + '</ul>' : match;
+    });
+    
+    // 9. Links
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    
+    // 10. Paragraphs
+    html = html.replace(/\n\n+/g, '</p><p>');
+    html = html.replace(/\n/g, '<br>');
+    
+    // 11. Summary block detection (wrap Bottom line, Summary, Conclusion, Recommendation)
+    var summaryLabels = /(<strong>\s*(?:Bottom line|Summary|Conclusion|Recommendation)\s*<\/strong>\s*:?\s*)([\s\S]*?)(?=<h[123]|<table|$)/gi;
+    html = html.replace(summaryLabels, function(match, label, content) {
+        content = content.replace(/^\s*<br\s*\/?>\s*/i, '').trim();
+        return '<div class="summary-block"><span class="summary-label">' + label.replace(/<strong>|<\/strong>/g, '').trim() + '</span>' + (content ? '<div>' + content + '</div>' : '') + '</div>';
+    });
+    
+    // 12. Wrap in p if needed
+    if (!html.startsWith('<h') && !html.startsWith('<ul') && !html.startsWith('<ol') && !html.startsWith('<pre') && !html.startsWith('<blockquote') && !html.startsWith('<table') && !html.startsWith('<div')) {
+        html = '<p>' + html + '</p>';
+    }
+    
+    // 13. Cleanup
+    html = html.replace(/<p><\/p>/g, '');
+    
+    return html;
+}
+
+function addLoading(customText) {
+    var container = document.getElementById('chat-container');
+    if (!container) return;
+    
+    var div = document.createElement('div');
+    div.className = 'message message-system';
+    div.innerHTML = 
+        '<div class="loading-bubble">' +
+            '<div class="loading-spinner"></div>' +
+            (customText ? '<span class="loading-text">' + customText + '</span>' : '') +
+        '</div>';
+    div.id = 'loading-' + Date.now();
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+    return div.id;
+}
+
+function removeMessage(id) {
+    var el = document.getElementById(id);
+    if (el) el.remove();
+}
+
+// --- UTILITY FUNCTIONS ---
+
+function escapeHtml(text) {
+    if (!text) return '';
+    var div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function formatFileSize(bytes) {
+    if (!bytes) return 'Unknown size';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+console.log('Joogni script fully loaded');
