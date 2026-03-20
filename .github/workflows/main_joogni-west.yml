@@ -58,16 +58,19 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Enable Oryx build (required for pip install on server)
+      - name: Configure deploy settings (Oryx + force overwrite)
         run: |
-          az webapp config appsettings set --name Joogni-West --resource-group GLG-AI --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true --output none
+          az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
+            --output none
 
       - name: Wait for SCM after config change
         run: sleep 90
 
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: 'Joogni-West'
-          slot-name: 'Production'
-          package: .
+      - name: Create deployment package
+        run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
+
+      - name: Deploy to Azure Web App (az CLI bypasses webapps-deploy v3 bug)
+        run: |
+          az webapp deploy --resource-group GLG-AI --name Joogni-West \
+            --src-path deploy.zip --type zip --clean true --restart true
