@@ -66,9 +66,8 @@ jobs:
         run: sleep 90
 
       - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
+        uses: azure/webapps-deploy@v2
         with:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
-          clean: true   # Remove old files before deploy so frontend updates
