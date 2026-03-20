@@ -29,11 +29,6 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Stamp deploy SHA into static files (busts Oryx content cache)
-        run: |
-          echo "/* deploy:${{ github.sha }} */" >> static/script.js
-          echo "/* deploy:${{ github.sha }} */" >> static/style.css
-
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -59,14 +54,16 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Enable Oryx build and force file overwrite on deploy
+      - name: Disable Oryx build (prevents static file cache restoration)
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
-            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
             --output none
 
-      - name: Wait for SCM after config change
-        run: sleep 90
+      - name: Set startup script
+        run: |
+          az webapp config set --name Joogni-West --resource-group GLG-AI \
+            --startup-file startup.sh --output none
 
       - name: Create deployment zip
         run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
