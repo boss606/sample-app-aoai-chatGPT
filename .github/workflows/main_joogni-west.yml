@@ -59,11 +59,11 @@ jobs:
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
             --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
             --output none
-
-      - name: Set startup script
-        run: |
           az webapp config set --name Joogni-West --resource-group GLG-AI \
             --startup-file startup.sh --output none
+
+      - name: Wait for SCM to restart after config changes
+        run: sleep 90
 
       - name: Create deployment zip
         run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
