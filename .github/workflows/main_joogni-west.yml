@@ -29,11 +29,6 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Sync frontend source files to static/
-        run: |
-          cp frontend/script.js static/script.js
-          cp frontend/style.css static/style.css
-
       - name: Refresh static file timestamps (ensures Azure overwrites all frontend files)
         run: find static/ templates/ -exec touch {} +
 
