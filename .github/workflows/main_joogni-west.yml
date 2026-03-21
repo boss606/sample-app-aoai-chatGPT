@@ -29,9 +29,6 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Force Oryx full rebuild by stamping requirements.txt
-        run: echo "# deploy:${{ github.sha }}" >> requirements.txt
-
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -57,7 +54,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Enable Oryx build (manages Python packages with forced full rebuild)
+      - name: Enable Oryx build
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
             --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true \
@@ -69,7 +66,35 @@ jobs:
       - name: Create deployment zip
         run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
 
-      - name: Deploy to Azure Web App
+      - name: Verify static/script.js inside zip (diagnostic)
+        run: |
+          echo "=== MD5 of static/script.js in zip ==="
+          unzip -p deploy.zip static/script.js | md5sum
+          echo "=== Last 3 lines of static/script.js in zip ==="
+          unzip -p deploy.zip static/script.js | tail -3
+          echo "=== MD5 of DEPLOY_SHA.txt in zip ==="
+          unzip -p deploy.zip DEPLOY_SHA.txt
+
+      - name: Deploy to Azure Web App (async to avoid gateway timeout)
         run: |
           az webapp deploy --resource-group GLG-AI --name Joogni-West \
-            --src-path deploy.zip --type zip --clean true --async false
+            --src-path deploy.zip --type zip --clean true --async true
+
+      - name: Poll until deployment completes
+        run: |
+          echo "Polling deployment status..."
+          for i in $(seq 1 20); do
+            STATUS=$(az webapp deployment list --name Joogni-West --resource-group GLG-AI \
+              --query "[0].provisioningState" -o tsv 2>/dev/null || echo "unknown")
+            echo "Attempt $i/20 — status: $STATUS"
+            if [ "$STATUS" = "Succeeded" ]; then
+              echo "Deployment succeeded!"
+              exit 0
+            fi
+            if [ "$STATUS" = "Failed" ]; then
+              echo "Deployment failed!"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Polling timed out — check Azure portal"
