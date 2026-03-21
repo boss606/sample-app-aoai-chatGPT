@@ -68,7 +68,10 @@ jobs:
             --name Joogni-West --resource-group GLG-AI -o json)
           KUDU_USER=$(echo "$CREDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['publishingUserName'])")
           KUDU_PASS=$(echo "$CREDS" | python3 -c "import sys,json; print(json.load(sys.stdin)['publishingPassword'])")
-          KUDU_URL="https://joogni-west.scm.azurewebsites.net"
+          SCM_HOST=$(az webapp show --name Joogni-West --resource-group GLG-AI \
+            --query "enabledHostNames[?contains(@, '.scm.')] | [0]" -o tsv)
+          KUDU_URL="https://$SCM_HOST"
+          echo "Kudu URL: $KUDU_URL"
 
           find static/ templates/ -type f | while read f; do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
