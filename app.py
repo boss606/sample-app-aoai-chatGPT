@@ -1942,6 +1942,72 @@ async def _stream_llm_to_queue_async(async_client: AsyncAzureOpenAI, model: str,
     await queue.put(None)
 
 
+async def _stream_with_tools_to_queue_async(
+    async_client: AsyncAzureOpenAI, model: str, messages: list,
+    queue: asyncio.Queue, tools: list, graph_token: Optional[str], temperature: float = 0.7
+):
+    """Stream first LLM call with tools. Forwards content chunks immediately.
+    If the model invokes tools, executes them and streams the 2nd response.
+    """
+    stream = await async_client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=temperature,
+        max_tokens=2000,
+        stream=True,
+    )
+
+    tool_calls_acc: dict = {}  # index -> {id, name, arguments}
+    assistant_content = ""
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+
+        if delta.content:
+            await queue.put(delta.content)
+            assistant_content += delta.content
+
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tool_calls_acc:
+                    tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                if tc.id:
+                    tool_calls_acc[idx]["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        tool_calls_acc[idx]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        tool_calls_acc[idx]["arguments"] += tc.function.arguments
+
+    # No tool calls — content was already streamed
+    if not tool_calls_acc or not graph_token:
+        await queue.put(None)
+        return
+
+    # Build tool call list and append assistant turn
+    tool_calls_list = [
+        {"id": v["id"], "type": "function", "function": {"name": v["name"], "arguments": v["arguments"]}}
+        for v in tool_calls_acc.values()
+    ]
+    messages.append({
+        "role": "assistant",
+        "content": assistant_content or None,
+        "tool_calls": tool_calls_list,
+    })
+
+    for tc in tool_calls_list:
+        tool_result = await execute_tool(tc["function"]["name"], json.loads(tc["function"]["arguments"]), graph_token, None)
+        messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
+
+    # Stream 2nd response after tool execution
+    await _stream_llm_to_queue_async(async_client, model, messages, queue, temperature=0.7)
+
+
 async def _execute_agentic_logic(
     data: dict, user_prefix: str, graph_token: Optional[str],
     stream_queue: Optional[asyncio.Queue] = None,
@@ -2190,9 +2256,13 @@ async def _execute_agentic_logic(
 
     try:
         t0_llm = time.perf_counter()
-        if stream_queue and not tools_for_request:
-            await _stream_llm_to_queue_async(async_client, deployment, chat_messages, stream_queue, temperature)
-            print(f"[perf] chat.completions.create (1st, streamed): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
+        if stream_queue:
+            if tools_for_request:
+                await _stream_with_tools_to_queue_async(async_client, deployment, chat_messages, stream_queue, tools_for_request, graph_token, temperature)
+                print(f"[perf] chat.completions.create (streamed, with tools): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
+            else:
+                await _stream_llm_to_queue_async(async_client, deployment, chat_messages, stream_queue, temperature)
+                print(f"[perf] chat.completions.create (streamed): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
             return ""
         response = await async_client.chat.completions.create(
             model=deployment,
@@ -2237,10 +2307,6 @@ async def _execute_agentic_logic(
             })
 
         t0_llm2 = time.perf_counter()
-        if stream_queue:
-            await _stream_llm_to_queue_async(async_client, deployment, chat_messages, stream_queue, 0.7)
-            print(f"[perf] chat.completions.create (2nd, after tools, streamed): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
-            return ""
         final_response = await async_client.chat.completions.create(
             model=deployment,
             messages=chat_messages,
@@ -2250,12 +2316,7 @@ async def _execute_agentic_logic(
         print(f"[perf] chat.completions.create (2nd, after tools): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
         return final_response.choices[0].message.content or ""
 
-    content = response_message.content or ""
-    if stream_queue:
-        if content:
-            await stream_queue.put(content)
-        return ""
-    return content
+    return response_message.content or ""
 
 
 @app.post("/api/conversation")
