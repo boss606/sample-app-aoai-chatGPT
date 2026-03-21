@@ -637,7 +637,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return True #bool(principal or id_token)
+    return bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:

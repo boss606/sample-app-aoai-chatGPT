@@ -58,6 +58,7 @@ jobs:
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
             --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
+                       POST_BUILD_COMMAND="pip install websockets==14.2" \
             --output none
           az webapp config appsettings delete --name Joogni-West --resource-group GLG-AI \
             --setting-names POST_BUILD_SCRIPT_PATH --output none 2>/dev/null || true

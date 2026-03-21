@@ -1424,6 +1424,9 @@ async function sendMessage() {
                         updateStreamingBubble(streamingBubble, fullText, false);
                     } else if (ev.type === 'done') {
                         receivedDone = ev.complete === true;
+                        if (streamingBubble) {
+                            updateStreamingBubble(streamingBubble, fullText, true);
+                        }
                     } else if (ev.type === 'error') {
                         wsError = ev.message || 'unknown';
                     }
