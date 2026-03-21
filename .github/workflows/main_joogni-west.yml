@@ -29,6 +29,9 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
+      - name: Force Oryx full rebuild by stamping requirements.txt
+        run: echo "# deploy:${{ github.sha }}" >> requirements.txt
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -54,21 +57,19 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Disable Oryx build (prevents static file cache restoration)
+      - name: Enable Oryx build (manages Python packages with forced full rebuild)
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
-            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true \
             --output none
-          az webapp config set --name Joogni-West --resource-group GLG-AI \
-            --startup-file startup.sh --output none
 
-      - name: Wait for SCM to restart after config changes
+      - name: Wait for SCM to restart after config change
         run: sleep 90
 
       - name: Create deployment zip
         run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
 
-      - name: Deploy to Azure Web App (clean deploy ensures all files are replaced)
+      - name: Deploy to Azure Web App
         run: |
           az webapp deploy --resource-group GLG-AI --name Joogni-West \
             --src-path deploy.zip --type zip --clean true --async false
