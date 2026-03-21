@@ -54,14 +54,21 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Configure Oryx with post-build script for static file refresh
+      - name: Ensure Oryx and post-build script are configured
         run: |
-          az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
-            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true POST_BUILD_SCRIPT_PATH=post_build.sh \
-            --output none
-
-      - name: Wait for SCM to restart after config change
-        run: sleep 90
+          CURRENT=$(az webapp config appsettings list \
+            --name Joogni-West --resource-group GLG-AI \
+            --query "[?name=='POST_BUILD_SCRIPT_PATH'].value" -o tsv)
+          if [ "$CURRENT" != "post_build.sh" ]; then
+            echo "Configuring app settings (first time only)..."
+            az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true POST_BUILD_SCRIPT_PATH=post_build.sh \
+              --output none
+            echo "Waiting for SCM to restart..."
+            sleep 120
+          else
+            echo "Settings already configured, skipping (no restart needed)."
+          fi
 
       - name: Create deployment zip
         run: zip -r deploy.zip . -x "*.git*" -x ".github/*" -x "*__pycache__*" -x "*.pyc" -x "antenv/*"
