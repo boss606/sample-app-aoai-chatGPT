@@ -2331,13 +2331,17 @@ async def _stream_agentic_events(
     task = asyncio.create_task(
         _execute_agentic_logic(data, user_prefix, graph_token, stream_queue=queue)
     )
+    # Flush Azure App Service nginx proxy buffer so tokens stream in real-time.
+    # Without this, nginx buffers the entire response and causes a Gateway Timeout.
+    yield f":{' ' * 4096}\n\n"
     try:
         while True:
             try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=300.0)
+                chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timeout'})}\n\n"
-                break
+                # Heartbeat prevents Gateway Timeout during long LLM calls
+                yield ": keep-alive\n\n"
+                continue
             if chunk is None:
                 break
             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
