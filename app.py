@@ -2250,7 +2250,12 @@ async def _execute_agentic_logic(
         print(f"[perf] chat.completions.create (2nd, after tools): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
         return final_response.choices[0].message.content or ""
 
-    return response_message.content or ""
+    content = response_message.content or ""
+    if stream_queue:
+        if content:
+            await stream_queue.put(content)
+        return ""
+    return content
 
 
 @app.post("/api/conversation")
@@ -2462,6 +2467,9 @@ async def agentic_websocket(websocket: WebSocket):
         task = asyncio.create_task(
             _execute_agentic_logic(data, user_prefix, graph_token, stream_queue=queue)
         )
+        # Guarantee the queue reader always unblocks when the task finishes,
+        # even if _execute_agentic_logic returns early without streaming.
+        task.add_done_callback(lambda _: queue.put_nowait(None))
         try:
             while True:
                 try:
