@@ -1388,75 +1388,69 @@ async function sendMessage() {
     var statusId = addAgenticStatus();
     updateAgenticStatus(statusId, 'Searching legal sources...', true);
 
+    var streamingBubble = null;
+    var fullText = '';
+    var receivedDone = false;
+    var wsError = null;
+
     try {
-        var response = await fetch('/api/agentic/stream', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                query: userContent,
-                jurisdiction: jurisdiction,
-                messages: messageHistory,
-                blobs: blobsToSend,
-                emails: emailsToSend,
-                calendar_events: calendarToSend,
-                free_mode: freeMode
-            }),
-            credentials: 'same-origin'
+        var wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var wsUrl = wsProtocol + '//' + location.host + '/api/agentic/ws';
+
+        await new Promise(function(resolve, reject) {
+            var ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                ws.send(JSON.stringify({
+                    query: userContent,
+                    jurisdiction: jurisdiction,
+                    messages: messageHistory,
+                    blobs: blobsToSend,
+                    emails: emailsToSend,
+                    calendar_events: calendarToSend,
+                    free_mode: freeMode
+                }));
+            };
+
+            ws.onmessage = function(event) {
+                try {
+                    var ev = JSON.parse(event.data);
+                    if (ev.type === 'token') {
+                        if (!streamingBubble) {
+                            removeMessage(statusId);
+                            streamingBubble = addStreamingMessageBubble();
+                        }
+                        fullText += ev.content || '';
+                        updateStreamingBubble(streamingBubble, fullText, false);
+                    } else if (ev.type === 'done') {
+                        receivedDone = ev.complete === true;
+                    } else if (ev.type === 'error') {
+                        wsError = ev.message || 'unknown';
+                    }
+                    // 'ping' messages are keep-alives, ignored
+                } catch (e) { /* ignore parse errors */ }
+            };
+
+            ws.onclose = function() { resolve(); };
+            ws.onerror = function() { reject(new Error('WebSocket connection failed')); };
         });
 
-        if (!response.ok) {
-            var errData = await response.json().catch(function() { return { detail: response.statusText }; });
+        if (wsError) {
             removeMessage(statusId);
-            addMessage('Error: ' + (errData.detail || errData.error || response.statusText), 'system-error');
+            addMessage('Error: ' + wsError, 'system-error');
             messageHistory.pop();
             return;
         }
 
-        if (!response.body) {
-            removeMessage(statusId);
-            addMessage('Streaming not supported.', 'system-error');
-            messageHistory.pop();
-            return;
+        if (streamingBubble) {
+            updateStreamingBubble(streamingBubble, fullText, true);
         }
-
-        removeMessage(statusId);
-        var streamingBubble = addStreamingMessageBubble();
-
-        var reader = response.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = '';
-        var fullText = '';
-        var receivedDone = false;
-
-        while (true) {
-            var result = await reader.read();
-            if (result.done) break;
-            buffer += decoder.decode(result.value, { stream: true });
-            var lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i];
-                if (line.startsWith('data: ')) {
-                    try {
-                        var ev = JSON.parse(line.slice(6));
-                        if (ev.type === 'token') {
-                            fullText += ev.content || '';
-                            updateStreamingBubble(streamingBubble, fullText, false);
-                        } else if (ev.type === 'done') {
-                            receivedDone = ev.complete === true;
-                        } else if (ev.type === 'error') {
-                            fullText += '\n\n[Erro: ' + (ev.message || 'unknown') + ']';
-                        }
-                    } catch (e) { /* ignore parse errors */ }
-                }
-            }
-        }
-
-        updateStreamingBubble(streamingBubble, fullText, true);
         if (!receivedDone && fullText) {
-            addMessage('Aviso: A resposta pode estar incompleta (conexão interrompida).', 'system');
+            addMessage('Warning: Response may be incomplete (connection interrupted).', 'system');
         }
-        messageHistory.push({ role: 'assistant', content: fullText });
+        if (fullText) {
+            messageHistory.push({ role: 'assistant', content: fullText });
+        }
 
     } catch (error) {
         removeMessage(statusId);

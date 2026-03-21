@@ -23,12 +23,12 @@ from typing import List, Tuple, Optional, TYPE_CHECKING, AsyncGenerator
 if TYPE_CHECKING:
     from openai import AzureOpenAI
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from openai import AzureOpenAI
+from openai import AzureOpenAI, AsyncAzureOpenAI
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob import (
@@ -1926,6 +1926,22 @@ def _stream_llm_to_queue_sync(client, model: str, messages: list, queue, loop, t
     loop.call_soon_threadsafe(queue.put_nowait, None)
 
 
+async def _stream_llm_to_queue_async(async_client: AsyncAzureOpenAI, model: str, messages: list, queue: asyncio.Queue, temperature: float = 0.7):
+    """Stream LLM tokens into queue using async client — no threads, true async concurrency."""
+    stream = await async_client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=2000,
+        stream=True,
+    )
+    async for chunk in stream:
+        content = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+        if content:
+            await queue.put(content)
+    await queue.put(None)
+
+
 async def _execute_agentic_logic(
     data: dict, user_prefix: str, graph_token: Optional[str],
     stream_queue: Optional[asyncio.Queue] = None,
@@ -1963,6 +1979,11 @@ async def _execute_agentic_logic(
 
     print("Creating AzureOpenAI client...", file=sys.stderr)
     client = AzureOpenAI(
+        api_key=key,
+        azure_endpoint=endpoint,
+        api_version=version,
+    )
+    async_client = AsyncAzureOpenAI(
         api_key=key,
         azure_endpoint=endpoint,
         api_version=version,
@@ -2170,19 +2191,10 @@ async def _execute_agentic_logic(
     try:
         t0_llm = time.perf_counter()
         if stream_queue and not tools_for_request:
-            await asyncio.to_thread(
-                _stream_llm_to_queue_sync,
-                client,
-                deployment,
-                chat_messages,
-                stream_queue,
-                asyncio.get_event_loop(),
-                temperature,
-            )
+            await _stream_llm_to_queue_async(async_client, deployment, chat_messages, stream_queue, temperature)
             print(f"[perf] chat.completions.create (1st, streamed): {time.perf_counter() - t0_llm:.2f}s", file=sys.stderr)
             return ""
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
+        response = await async_client.chat.completions.create(
             model=deployment,
             messages=chat_messages,
             tools=tools_for_request,
@@ -2226,19 +2238,10 @@ async def _execute_agentic_logic(
 
         t0_llm2 = time.perf_counter()
         if stream_queue:
-            await asyncio.to_thread(
-                _stream_llm_to_queue_sync,
-                client,
-                deployment,
-                chat_messages,
-                stream_queue,
-                asyncio.get_event_loop(),
-                0.7,
-            )
+            await _stream_llm_to_queue_async(async_client, deployment, chat_messages, stream_queue, 0.7)
             print(f"[perf] chat.completions.create (2nd, after tools, streamed): {time.perf_counter() - t0_llm2:.2f}s", file=sys.stderr)
             return ""
-        final_response = await asyncio.to_thread(
-            client.chat.completions.create,
+        final_response = await async_client.chat.completions.create(
             model=deployment,
             messages=chat_messages,
             temperature=0.7,
@@ -2415,6 +2418,74 @@ async def conversation_stream(request: Request):
         import traceback
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/api/agentic/ws")
+async def agentic_websocket(websocket: WebSocket):
+    """WebSocket streaming chat — bypasses Easy Auth proxy buffering."""
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        jurisdiction_raw = data.get("jurisdiction", "California")
+        jid, j_config = resolve_jurisdiction(jurisdiction_raw)
+        display_name = j_config.get("display_name", jurisdiction_raw)
+
+        if not j_config.get("implemented"):
+            await websocket.send_json({"type": "error", "message": f"This state ({display_name}) is not yet supported."})
+            return
+
+        user_prefix = _get_user_blob_prefix(websocket)
+        graph_token = await get_valid_graph_token(websocket)
+
+        blobs = data.get("blobs", [])
+        if blobs:
+            for b in blobs:
+                fn = (b.get("original_filename") or b.get("blob_name") or "")
+                if not _is_supported_attachment(fn):
+                    await websocket.send_json({"type": "error", "message": "Unsupported file type. Only PDF and Word (.docx) are allowed."})
+                    return
+            blobs_without_job = [b for b in blobs if not b.get("job_id")]
+            if blobs_without_job:
+                names = [b.get("original_filename", "file") for b in blobs_without_job]
+                await websocket.send_json({"type": "error", "message": f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload."})
+                return
+            processing_names = []
+            for b in [b for b in blobs if b.get("job_id")]:
+                job = get_job(user_prefix, b.get("job_id"))
+                if not job or job.get("status") != "completed":
+                    processing_names.append(b.get("original_filename", "file"))
+            if processing_names:
+                await websocket.send_json({"type": "error", "message": f"Document(s) still processing: {', '.join(processing_names)}. Please wait and try again."})
+                return
+
+        queue: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(
+            _execute_agentic_logic(data, user_prefix, graph_token, stream_queue=queue)
+        )
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await websocket.send_json({"type": "ping"})
+                    continue
+                if chunk is None:
+                    break
+                await websocket.send_json({"type": "token", "content": chunk})
+            await websocket.send_json({"type": "done", "complete": True})
+        except WebSocketDisconnect:
+            task.cancel()
+        finally:
+            await task
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
 
 
 @app.get("/api/graph/health")
