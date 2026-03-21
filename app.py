@@ -2332,8 +2332,9 @@ async def _stream_agentic_events(
         _execute_agentic_logic(data, user_prefix, graph_token, stream_queue=queue)
     )
     # Flush Azure App Service nginx proxy buffer so tokens stream in real-time.
-    # Without this, nginx buffers the entire response and causes a Gateway Timeout.
-    yield f":{' ' * 4096}\n\n"
+    # nginx default proxy_buffers total ~64KB; send 80KB to guarantee overflow.
+    for _ in range(20):
+        yield f":{' ' * 4096}\n\n"
     try:
         while True:
             try:
