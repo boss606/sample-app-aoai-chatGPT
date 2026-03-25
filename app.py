@@ -242,9 +242,12 @@ ATTACHMENT_MAX_BYTES = int(_ATTACHMENT_MAX_MB) * 1024 * 1024
 ATTACHMENT_MAX_CHUNKS = int(os.getenv("ATTACHMENT_MAX_CHUNKS", "50"))
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-3-large; must match Azure Search index contentVector
-PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "30"))
+PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "100"))
 PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "150"))
 PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
+# Above this page count, rasterize OCR at PDF_OCR_DPI_LONG_DOCUMENT (capped vs PDF_OCR_DPI) to cut peak RAM.
+PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD = int(os.getenv("PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD", "25"))
+PDF_OCR_DPI_LONG_DOCUMENT = int(os.getenv("PDF_OCR_DPI_LONG_DOCUMENT", "110"))
 # Below this token count, send full extracted text to LLM (skip RAG indexing)
 ATTACHMENT_FULL_TEXT_MAX_TOKENS = int(os.getenv("ATTACHMENT_FULL_TEXT_MAX_TOKENS", "4000"))
 
@@ -848,8 +851,8 @@ def _iter_pdf_text_pages(file_bytes: bytes):
         yield page.extract_text() or ""
 
 
-def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int):
-    """Generator yielding OCR text from each PDF page (avoids accumulating ocr_chunks list)."""
+def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int, dpi: int):
+    """Generator yielding OCR text from each PDF page (one page rasterized at a time; dpi controls memory)."""
     from pdf2image import convert_from_bytes  # type: ignore
     import pytesseract  # type: ignore
 
@@ -857,7 +860,7 @@ def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int):
         try:
             images = convert_from_bytes(
                 file_bytes,
-                dpi=PDF_OCR_DPI,
+                dpi=dpi,
                 first_page=page_num,
                 last_page=page_num,
             )
@@ -933,7 +936,17 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
             raise HTTPException(status_code=400, detail=f"PDF {filename} is empty or has no readable pages.")
 
         max_pages = min(page_count, PDF_OCR_MAX_PAGES)
-        print(f"[PDF] OCR needed for {filename}: {page_count} pages, processing {max_pages}", file=sys.stderr)
+        ocr_dpi = PDF_OCR_DPI
+        if max_pages > PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD:
+            ocr_dpi = min(PDF_OCR_DPI, PDF_OCR_DPI_LONG_DOCUMENT)
+            print(
+                f"[PDF] OCR DPI reduced to {ocr_dpi} for {max_pages} pages (threshold {PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD})",
+                file=sys.stderr,
+            )
+        print(
+            f"[PDF] OCR needed for {filename}: {page_count} pages, processing {max_pages} at {ocr_dpi} DPI",
+            file=sys.stderr,
+        )
         if page_count > PDF_OCR_MAX_PAGES:
             raise HTTPException(
                 status_code=400,
@@ -955,7 +968,7 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
                 ),
             ) from import_err
 
-        ocr_content = "\n".join(_iter_pdf_ocr_pages(file_bytes, max_pages)).strip()
+        ocr_content = "\n".join(_iter_pdf_ocr_pages(file_bytes, max_pages, ocr_dpi)).strip()
         if ocr_content:
             return ocr_content
 
