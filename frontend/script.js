@@ -4,6 +4,8 @@ var selectedEmails = [];
 var selectedCalendarEvents = [];
 // Pollers for attachment job status (job_id -> intervalId)
 var attachmentJobPollers = {};
+// While user is uploading/attaching (before register-attachment responds)
+var attachmentUploadInProgress = false;
 // Conversation history for backend continuity (reuse context across turns)
 var messageHistory = [];
 var searchSource = 'email';
@@ -1071,7 +1073,12 @@ async function handleFileSelect(event) {
     var files = event.target.files;
     if (!files || files.length === 0) return;
 
-    for (var i = 0; i < files.length; i++) {
+    // Block sending immediately while upload+register is in progress.
+    attachmentUploadInProgress = true;
+    updateSendButtonState();
+
+    try {
+        for (var i = 0; i < files.length; i++) {
         var file = files[i];
         var ext = (file.name || '').split('.').pop().toLowerCase();
         if (ext !== 'pdf' && ext !== 'docx') {
@@ -1149,6 +1156,10 @@ async function handleFileSelect(event) {
     }
 
     event.target.value = '';
+    } finally {
+        attachmentUploadInProgress = false;
+        updateSendButtonState();
+    }
 }
 
 function stopAttachmentJobPolling(jobId) {
@@ -1167,14 +1178,16 @@ function startAttachmentJobPolling(jobId) {
             if (!r.ok) return;
             var data = await r.json();
             var st = (data.status || '').toLowerCase();
-            if (st === 'completed' || st === 'failed') {
-                stopAttachmentJobPolling(jobId);
-                var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
-                if (f) {
-                    f.status = st;
+            var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
+            if (f) {
+                f.status = st;
+                // Keep send button state in sync even while still pending/processing
+                updateSendButtonState();
+                if (st === 'completed' || st === 'failed') {
                     updateAttachmentsUI();
                 }
             }
+            if (st === 'completed' || st === 'failed') stopAttachmentJobPolling(jobId);
         } catch (e) {
             console.warn('Attachment job poll error:', e);
         }
@@ -1182,9 +1195,12 @@ function startAttachmentJobPolling(jobId) {
 }
 
 function hasProcessingAttachments() {
+    if (attachmentUploadInProgress) return true;
     return attachedFiles.some(function(f) {
-        var s = (f.status || '').toLowerCase();
-        return s === 'pending' || s === 'processing';
+        // Block sending while any attachment job exists and is not finished.
+        var s = (f.status || '').toLowerCase().trim();
+        if (!f.job_id) return false;
+        return s !== 'completed' && s !== 'failed';
     });
 }
 
