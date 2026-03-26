@@ -36,6 +36,7 @@ from azure.storage.blob import (
     BlobSasPermissions,
     generate_blob_sas,
 )
+from azure.storage.queue import QueueClient
 
 from azure.identity import DefaultAzureCredential
 from pypdf import PdfReader
@@ -245,11 +246,13 @@ VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", "3072"))  # text-embedding-
 PDF_OCR_MAX_PAGES = int(os.getenv("PDF_OCR_MAX_PAGES", "100"))
 PDF_OCR_DPI = int(os.getenv("PDF_OCR_DPI", "150"))
 PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
-# Above this page count, rasterize OCR at PDF_OCR_DPI_LONG_DOCUMENT (capped vs PDF_OCR_DPI) to cut peak RAM.
-PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD = int(os.getenv("PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD", "25"))
+# If > 0: above this many pages, use PDF_OCR_DPI_LONG_DOCUMENT (min with PDF_OCR_DPI) to lower peak RAM.
+# Default 0 = disabled so OCR always uses full PDF_OCR_DPI (better text quality for summaries).
+PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD = int(os.getenv("PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD", "0"))
 PDF_OCR_DPI_LONG_DOCUMENT = int(os.getenv("PDF_OCR_DPI_LONG_DOCUMENT", "110"))
 # Below this token count, send full extracted text to LLM (skip RAG indexing)
 ATTACHMENT_FULL_TEXT_MAX_TOKENS = int(os.getenv("ATTACHMENT_FULL_TEXT_MAX_TOKENS", "4000"))
+ATTACHMENT_QUEUE_NAME = os.getenv("ATTACHMENT_QUEUE_NAME", "attachment-jobs")
 
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 print("AZURE_OPENAI_EMBEDDING_DEPLOYMENT present:", bool(deployment_name))
@@ -937,7 +940,10 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
 
         max_pages = min(page_count, PDF_OCR_MAX_PAGES)
         ocr_dpi = PDF_OCR_DPI
-        if max_pages > PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD:
+        if (
+            PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD > 0
+            and max_pages > PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD
+        ):
             ocr_dpi = min(PDF_OCR_DPI, PDF_OCR_DPI_LONG_DOCUMENT)
             print(
                 f"[PDF] OCR DPI reduced to {ocr_dpi} for {max_pages} pages (threshold {PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD})",
@@ -1232,6 +1238,39 @@ def _check_search_connectivity(search_service: str, label: str = "Attachment") -
         err = f"Connection to {host}:{port} failed (errno={getattr(e, 'errno', '?')}): {e}"
         print(f"[{label}] {err}", file=sys.stderr)
         return err
+
+
+def _get_attachment_queue_client() -> QueueClient:
+    """Return QueueClient for attachment processing queue."""
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        raise HTTPException(
+            status_code=500,
+            detail="Queue unavailable: AZURE_STORAGE_CONNECTION_STRING is not configured",
+        )
+    q = QueueClient.from_connection_string(conn_str, ATTACHMENT_QUEUE_NAME)
+    try:
+        q.create_queue()
+    except Exception:
+        pass
+    return q
+
+
+def enqueue_attachment_job(
+    job_id: str,
+    partition_key: str,
+    blob_name: str,
+    original_filename: str,
+) -> None:
+    """Enqueue attachment processing message for out-of-band worker."""
+    q = _get_attachment_queue_client()
+    payload = {
+        "job_id": job_id,
+        "partition_key": partition_key,
+        "blob_name": blob_name,
+        "original_filename": original_filename,
+    }
+    q.send_message(json.dumps(payload, ensure_ascii=True))
 
 
 def process_attachment_job(job_id: str, partition_key: str, blob_name: str, original_filename: str):
@@ -1842,7 +1881,7 @@ async def delete_attachment(request: Request):
 
 
 @app.post("/api/register-attachment")
-async def register_attachment(request: Request, background_tasks: BackgroundTasks):
+async def register_attachment(request: Request):
     """Register an uploaded blob for background processing. Returns job_id."""
     if not is_authenticated(request):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -1867,7 +1906,7 @@ async def register_attachment(request: Request, background_tasks: BackgroundTask
         if not create_job(user_prefix, job_id, blob_name, original_filename):
             raise HTTPException(status_code=500, detail="Failed to create job")
 
-        background_tasks.add_task(process_attachment_job, job_id, user_prefix, blob_name, original_filename)
+        enqueue_attachment_job(job_id, user_prefix, blob_name, original_filename)
         return JSONResponse({
             "job_id": job_id,
             "blob_name": blob_name,
