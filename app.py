@@ -250,6 +250,7 @@ PDF_OCR_LANG = os.getenv("PDF_OCR_LANG", "eng")
 # Default 0 = disabled so OCR always uses full PDF_OCR_DPI (better text quality for summaries).
 PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD = int(os.getenv("PDF_OCR_MEMORY_SAFE_PAGE_THRESHOLD", "0"))
 PDF_OCR_DPI_LONG_DOCUMENT = int(os.getenv("PDF_OCR_DPI_LONG_DOCUMENT", "110"))
+PDF_OCR_MAX_WORKERS = int(os.getenv("PDF_OCR_MAX_WORKERS", "4"))
 # Below this token count, send full extracted text to LLM (skip RAG indexing)
 ATTACHMENT_FULL_TEXT_MAX_TOKENS = int(os.getenv("ATTACHMENT_FULL_TEXT_MAX_TOKENS", "4000"))
 ATTACHMENT_QUEUE_NAME = os.getenv("ATTACHMENT_QUEUE_NAME", "attachment-jobs")
@@ -854,39 +855,57 @@ def _iter_pdf_text_pages(file_bytes: bytes):
         yield page.extract_text() or ""
 
 
-def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int, dpi: int):
-    """Generator yielding OCR text from each PDF page (one page rasterized at a time; dpi controls memory)."""
+def _ocr_single_page(args: tuple) -> tuple[int, str]:
+    """Convert and OCR a single PDF page. Returns (page_num, text)."""
     from pdf2image import convert_from_bytes  # type: ignore
     import pytesseract  # type: ignore
 
-    for page_num in range(1, max_pages + 1):
+    file_bytes, page_num, dpi = args
+    try:
+        images = convert_from_bytes(
+            file_bytes,
+            dpi=dpi,
+            first_page=page_num,
+            last_page=page_num,
+        )
+    except Exception as conv_err:
+        print(f"OCR conversion failed on page {page_num}: {conv_err}", file=sys.stderr)
+        return page_num, ""
+
+    txt = ""
+    for img in images:
         try:
-            images = convert_from_bytes(
-                file_bytes,
-                dpi=dpi,
-                first_page=page_num,
-                last_page=page_num,
-            )
-        except Exception as conv_err:
-            print(f"OCR conversion failed on page {page_num}: {conv_err}", file=sys.stderr)
-            continue
-
-        for img in images:
+            txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
+        except Exception as ocr_err:
+            print(f"OCR failed on page {page_num}: {ocr_err}", file=sys.stderr)
+        finally:
             try:
-                txt = pytesseract.image_to_string(img, lang=PDF_OCR_LANG) or ""
-            except Exception as ocr_err:
-                print(f"OCR failed on page {page_num}: {ocr_err}", file=sys.stderr)
-                continue
-            finally:
-                try:
-                    img.close()
-                except Exception:
-                    pass
-            if txt.strip():
-                yield txt.strip()
+                img.close()
+            except Exception:
+                pass
 
-        del images
-        gc.collect()
+    del images
+    gc.collect()
+    return page_num, txt.strip()
+
+
+def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int, dpi: int):
+    """Yield OCR text per PDF page in order, processing pages in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    args = [(file_bytes, page_num, dpi) for page_num in range(1, max_pages + 1)]
+    results: dict[int, str] = {}
+
+    with ThreadPoolExecutor(max_workers=PDF_OCR_MAX_WORKERS) as executor:
+        futures = {executor.submit(_ocr_single_page, arg): arg[1] for arg in args}
+        for future in as_completed(futures):
+            page_num, txt = future.result()
+            results[page_num] = txt
+
+    for page_num in range(1, max_pages + 1):
+        txt = results.get(page_num, "")
+        if txt:
+            yield txt
 
 
 _ATTACHMENT_ALLOWED_EXT = (".pdf", ".docx")
