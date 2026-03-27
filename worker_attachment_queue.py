@@ -86,6 +86,10 @@ def _get_lock_blob() -> BlobClient:
         blob.upload_blob(b"", overwrite=False)
     except ResourceExistsError:
         pass
+    except HttpResponseError as e:
+        if e.error_code != "LeaseIdMissing":
+            raise
+        # Blob exists and is currently leased by another instance — no need to create it
     return blob
 
 
