@@ -89,21 +89,20 @@ def _get_lock_blob() -> BlobClient:
     return blob
 
 
-def _renew_loop(blob: BlobClient, lease_id: str, stop: threading.Event) -> None:
+def _renew_loop(lease, stop: threading.Event) -> None:
     """Background thread that renews the blob lease every _LEASE_RENEW_INTERVAL seconds."""
     while not stop.wait(_LEASE_RENEW_INTERVAL):
         try:
-            blob.get_blob_lease(lease_id).renew()
+            lease.renew()
         except Exception as e:
             print(f"[QueueWorker] Lease renewal failed: {e}", file=sys.stderr)
             stop.set()
 
 
-def _acquire_lease(blob: BlobClient) -> str | None:
-    """Try to acquire the blob lease. Returns lease_id or None if already held."""
+def _acquire_lease(blob: BlobClient):
+    """Try to acquire the blob lease. Returns BlobLeaseClient or None if already held."""
     try:
-        lease = blob.acquire_lease(lease_duration=_LEASE_DURATION)
-        return lease.id
+        return blob.acquire_lease(lease_duration=_LEASE_DURATION)
     except HttpResponseError as e:
         if e.error_code == "LeaseAlreadyPresent":
             return None
@@ -118,15 +117,15 @@ def main() -> None:
     blob = _get_lock_blob()
 
     while True:
-        lease_id = _acquire_lease(blob)
-        if lease_id is None:
+        lease = _acquire_lease(blob)
+        if lease is None:
             print(f"[QueueWorker] Lease held by another instance; retrying in {_LEASE_RETRY_INTERVAL}s", file=sys.stderr)
             time.sleep(_LEASE_RETRY_INTERVAL)
             continue
 
         print(f"[QueueWorker] Lease acquired — listening queue={QUEUE_NAME}", file=sys.stderr)
         stop = threading.Event()
-        renewer = threading.Thread(target=_renew_loop, args=(blob, lease_id, stop), daemon=True)
+        renewer = threading.Thread(target=_renew_loop, args=(lease, stop), daemon=True)
         renewer.start()
 
         try:
@@ -156,7 +155,7 @@ def main() -> None:
         finally:
             stop.set()
             try:
-                blob.get_blob_lease(lease_id).release()
+                lease.release()
                 print("[QueueWorker] Lease released", file=sys.stderr)
             except Exception:
                 pass
