@@ -1172,16 +1172,26 @@ function stopAttachmentJobPolling(jobId) {
 function startAttachmentJobPolling(jobId) {
     if (!jobId || attachmentJobPollers[jobId]) return;
     var interval = 2000;
-    attachmentJobPollers[jobId] = setInterval(async function() {
+
+    async function pollOnce() {
         try {
             var r = await fetch('/api/jobs/' + jobId, { credentials: 'same-origin' });
+            var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
+            if (r.status === 404) {
+                if (f) {
+                    f.status = 'failed';
+                    updateAttachmentsUI();
+                } else {
+                    updateSendButtonState();
+                }
+                stopAttachmentJobPolling(jobId);
+                return;
+            }
             if (!r.ok) return;
             var data = await r.json();
-            var st = (data.status || '').toLowerCase();
-            var f = attachedFiles.find(function(x) { return x.job_id === jobId; });
+            var st = (data.status || '').toLowerCase().trim();
             if (f) {
                 f.status = st;
-                // Keep send button state in sync even while still pending/processing
                 updateSendButtonState();
                 if (st === 'completed' || st === 'failed') {
                     updateAttachmentsUI();
@@ -1191,7 +1201,9 @@ function startAttachmentJobPolling(jobId) {
         } catch (e) {
             console.warn('Attachment job poll error:', e);
         }
-    }, interval);
+    }
+
+    attachmentJobPollers[jobId] = setInterval(pollOnce, interval);
 }
 
 function hasProcessingAttachments() {

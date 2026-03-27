@@ -1270,7 +1270,35 @@ def enqueue_attachment_job(
         "blob_name": blob_name,
         "original_filename": original_filename,
     }
-    q.send_message(json.dumps(payload, ensure_ascii=True))
+    body = json.dumps(payload, ensure_ascii=True)
+    q.send_message(body)
+    print(
+        f"[register-attachment] enqueued job_id={job_id} queue={ATTACHMENT_QUEUE_NAME} "
+        f"partition_key={partition_key} blob={blob_name}",
+        file=sys.stderr,
+    )
+
+
+# Throttle repeated identical [jobs] poll lines (frontend polls every ~2s).
+_job_status_poll_log_state: dict[str, tuple[str, float]] = {}
+
+
+def _log_job_status_poll(job_id: str, status: str) -> None:
+    """Log job poll: on first seen, on status change, or every 30s for same status."""
+    now = time.time()
+    prev = _job_status_poll_log_state.get(job_id)
+    if prev is None:
+        _job_status_poll_log_state[job_id] = (status, now)
+        print(f"[jobs] GET job_id={job_id} status={status}", file=sys.stderr)
+        if status in ("completed", "failed"):
+            _job_status_poll_log_state.pop(job_id, None)
+        return
+    prev_status, prev_ts = prev
+    if prev_status != status or (now - prev_ts) >= 30.0:
+        _job_status_poll_log_state[job_id] = (status, now)
+        print(f"[jobs] GET job_id={job_id} status={status}", file=sys.stderr)
+    if status in ("completed", "failed"):
+        _job_status_poll_log_state.pop(job_id, None)
 
 
 def process_attachment_job(job_id: str, partition_key: str, blob_name: str, original_filename: str):
@@ -1925,6 +1953,15 @@ async def job_storage_status():
     return JSONResponse({"backend": backend, "using_azure_table": backend == "azure_table"})
 
 
+def _normalize_attachment_job_status(job: dict) -> str:
+    """Azure Table entities may use different key casing; normalize for JSON."""
+    raw = job.get("status") if job.get("status") is not None else job.get("Status")
+    if raw is None:
+        return "unknown"
+    s = str(raw).strip().lower()
+    return s if s else "unknown"
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job_status(job_id: str, request: Request):
     """Get status of an attachment processing job."""
@@ -1933,14 +1970,20 @@ async def get_job_status(job_id: str, request: Request):
     user_prefix = _get_user_blob_prefix(request)
     job = get_job(user_prefix, job_id)
     if not job:
+        print(
+            f"[jobs] GET job_id={job_id} not_found partition_key={user_prefix}",
+            file=sys.stderr,
+        )
         raise HTTPException(status_code=404, detail="Job not found")
-    status = job.get("status", "unknown")
+    status = _normalize_attachment_job_status(job)
+    _log_job_status_poll(job_id, status)
+    err_raw = job.get("error") if job.get("error") is not None else job.get("Error")
     return JSONResponse({
         "job_id": job_id,
         "status": status,
         "blob_name": job.get("blob_name"),
         "original_filename": job.get("original_filename"),
-        "error": job.get("error") if status == "failed" else None,
+        "error": err_raw if status == "failed" else None,
     })
 
 
