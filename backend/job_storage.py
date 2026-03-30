@@ -101,8 +101,9 @@ def update_job_status(
     status: str,
     error: Optional[str] = None,
     use_full_text: Optional[bool] = None,
+    doc_type: Optional[str] = None,
 ) -> bool:
-    """Update job status (processing, completed, failed). Optionally set use_full_text for full-text mode (skip RAG)."""
+    """Update job status (processing, completed, failed). Optionally set use_full_text and doc_type."""
     table = _ensure_table()
     if table:
         try:
@@ -112,6 +113,8 @@ def update_job_status(
                 entity["error"] = str(error)[:1000]
             if use_full_text is not None:
                 entity["use_full_text"] = "true" if use_full_text else "false"
+            if doc_type is not None:
+                entity["doc_type"] = doc_type
             table.update_entity(entity=entity)
             return True
         except Exception as e:
@@ -124,6 +127,8 @@ def update_job_status(
             _in_memory_jobs[key]["error"] = str(error)[:1000]
         if use_full_text is not None:
             _in_memory_jobs[key]["use_full_text"] = "true" if use_full_text else "false"
+        if doc_type is not None:
+            _in_memory_jobs[key]["doc_type"] = doc_type
         return True
     return False
 

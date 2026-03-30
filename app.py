@@ -1082,6 +1082,59 @@ def _count_tokens(text: str) -> int:
     return len(text) // 4
 
 
+_DOC_TYPE_LABELS = {
+    "pleading": "Pleading (complaint, answer, motion, petition)",
+    "brief": "Brief / Memorandum of Law",
+    "exhibit_list": "Exhibit List / Evidence Index",
+    "evidence": "Actual Evidence (contract, record, statement, photo)",
+    "summary": "Summary / Abstract of Facts",
+    "communication": "Communication (email, letter, text)",
+    "unknown": "Unknown / Unclassified",
+}
+
+_VALID_DOC_TYPES = set(_DOC_TYPE_LABELS.keys())
+
+
+def _classify_document(text: str, key: str, endpoint: str) -> str:
+    """Call LLM to classify the document type. Returns one of the keys in _DOC_TYPE_LABELS."""
+    try:
+        snippet = text[:3000]
+        classify_client = AzureOpenAI(
+            api_key=key,
+            azure_endpoint=endpoint,
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
+        )
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
+        resp = classify_client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a legal document classifier. "
+                        "Classify the document into exactly ONE of these categories:\n"
+                        "- pleading: complaints, answers, motions, petitions, responses\n"
+                        "- brief: legal briefs, memoranda, points & authorities\n"
+                        "- exhibit_list: list of exhibits or evidence index\n"
+                        "- evidence: actual evidence documents (contracts, emails as exhibits, records, statements, photos)\n"
+                        "- summary: summaries or abstracts of evidence or facts prepared by counsel\n"
+                        "- communication: emails, letters, text messages between parties (not as exhibits)\n"
+                        "- unknown: cannot be determined\n\n"
+                        "Respond with ONLY the category name, nothing else."
+                    ),
+                },
+                {"role": "user", "content": f"Classify this document:\n\n{snippet}"},
+            ],
+            temperature=0,
+            max_tokens=10,
+        )
+        result = resp.choices[0].message.content.strip().lower()
+        return result if result in _VALID_DOC_TYPES else "unknown"
+    except Exception as e:
+        print(f"[Classification] Failed: {e}", file=sys.stderr)
+        return "unknown"
+
+
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     denom = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
     if denom == 0:
@@ -1347,17 +1400,6 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         text = _extract_text_from_file(file_bytes, original_filename)
         del file_bytes
         gc.collect()
-        token_count = _count_tokens(text)
-        if token_count <= ATTACHMENT_FULL_TEXT_MAX_TOKENS:
-            update_job_status(partition_key, job_id, "completed", use_full_text=True)
-            print(f"[Attachment] Job {job_id} completed (full-text): {blob_name} -> {token_count} tokens", file=sys.stderr)
-            return
-        chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
-        del text
-        gc.collect()
-        if not chunk_texts:
-            update_job_status(partition_key, job_id, "completed")  # No text, nothing to index
-            return
 
         key = os.getenv("AZURE_OPENAI_KEY")
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -1366,6 +1408,21 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         search_key = os.getenv("AZURE_SEARCH_KEY")
         if not all([key, endpoint, search_service, search_index, search_key]):
             update_job_status(partition_key, job_id, "failed", "Azure config missing")
+            return
+
+        doc_type = _classify_document(text, key, endpoint)
+        print(f"[Attachment] Job {job_id} classified as '{doc_type}': {blob_name}", file=sys.stderr)
+
+        token_count = _count_tokens(text)
+        if token_count <= ATTACHMENT_FULL_TEXT_MAX_TOKENS:
+            update_job_status(partition_key, job_id, "completed", use_full_text=True, doc_type=doc_type)
+            print(f"[Attachment] Job {job_id} completed (full-text): {blob_name} -> {token_count} tokens", file=sys.stderr)
+            return
+        chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
+        del text
+        gc.collect()
+        if not chunk_texts:
+            update_job_status(partition_key, job_id, "completed", doc_type=doc_type)
             return
 
         client = AzureOpenAI(api_key=key, azure_endpoint=endpoint, api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"))
@@ -1402,7 +1459,7 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
             batch_size = 50
             for j in range(0, len(docs_to_upload), batch_size):
                 search_client.upload_documents(documents=docs_to_upload[j : j + batch_size])
-        update_job_status(partition_key, job_id, "completed")
+        update_job_status(partition_key, job_id, "completed", doc_type=doc_type)
         print(f"[Attachment] Job {job_id} completed: {blob_name} -> {len(docs_to_upload)} chunks", file=sys.stderr)
     except Exception as e:
         import traceback
@@ -2270,6 +2327,7 @@ async def _execute_agentic_logic(
             failed_jobs = []
             full_text_blobs: List[dict] = []
             rag_blob_names: List[str] = []
+            record_status_lines: List[str] = []
             for b in blobs_with_job:
                 att_job_id = b.get("job_id")
                 blob_name = b.get("blob_name")
@@ -2282,6 +2340,9 @@ async def _execute_agentic_logic(
                     continue
                 st = job.get("status", "pending")
                 if st == "completed":
+                    raw_type = job.get("doc_type") or "unknown"
+                    type_label = _DOC_TYPE_LABELS.get(raw_type, "Unknown / Unclassified")
+                    record_status_lines.append(f"- {orig} → {type_label}")
                     if job.get("use_full_text") == "true":
                         full_text_blobs.append(b)
                     else:
@@ -2296,6 +2357,30 @@ async def _execute_agentic_logic(
             if failed_jobs:
                 err_parts = [f"{n}: {e}" for n, e in failed_jobs]
                 raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
+
+            if record_status_lines:
+                uploaded_types = {line.split("→")[-1].strip() for line in record_status_lines}
+                missing_flags: List[str] = []
+                if not any("Pleading" in t for t in uploaded_types):
+                    missing_flags.append("No pleadings or motions uploaded")
+                if not any("Evidence" in t for t in uploaded_types):
+                    missing_flags.append("No actual evidence documents uploaded")
+                missing_section = (
+                    "\nMissing from record:\n" + "\n".join(f"- {m}" for m in missing_flags)
+                    if missing_flags else "\nNo obvious gaps detected in uploaded record."
+                )
+                record_status_block = (
+                    "=== RECORD STATUS ===\n"
+                    "The following documents have been uploaded and classified:\n\n"
+                    + "\n".join(record_status_lines)
+                    + missing_section
+                    + "\n\nIMPORTANT: Base your analysis strictly on these classified documents. "
+                    "Do not assume the existence of materials not listed above. "
+                    "If you change your understanding of what is in the record, explicitly acknowledge the correction.\n"
+                    "====================="
+                )
+                chat_messages.insert(1, {"role": "user", "content": record_status_block})
+
             if full_text_blobs:
                 try:
                     t0_ft = time.perf_counter()
