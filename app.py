@@ -890,13 +890,18 @@ def _ocr_single_page(args: tuple) -> tuple[int, str]:
 
 
 def _iter_pdf_ocr_pages(file_bytes: bytes, max_pages: int, dpi: int):
-    """Yield OCR text per PDF page in order, processing pages in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Yield OCR text per PDF page in order, processing pages in parallel.
+
+    Uses ProcessPoolExecutor to bypass the GIL and achieve true CPU parallelism
+    for Tesseract (CPU-bound). Results are ordered by page number regardless of
+    completion order.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     args = [(file_bytes, page_num, dpi) for page_num in range(1, max_pages + 1)]
     results: dict[int, str] = {}
 
-    with ThreadPoolExecutor(max_workers=PDF_OCR_MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=PDF_OCR_MAX_WORKERS) as executor:
         futures = {executor.submit(_ocr_single_page, arg): arg[1] for arg in args}
         for future in as_completed(futures):
             page_num, txt = future.result()
@@ -951,6 +956,33 @@ def _extract_text_from_pdf(file_bytes: bytes, filename: str) -> str:
         content = "\n".join(_iter_pdf_text_pages(file_bytes)).strip()
         if content:
             return content
+
+        # Azure Document Intelligence path — offloads OCR to Azure cloud (much faster than local Tesseract).
+        # Activated when FORM_RECOGNIZER_ENDPOINT + FORM_RECOGNIZER_KEY (or DOC_INTEL_* equivalents) are set.
+        doc_intel_endpoint = os.getenv("FORM_RECOGNIZER_ENDPOINT") or os.getenv("DOC_INTEL_ENDPOINT")
+        doc_intel_key = os.getenv("FORM_RECOGNIZER_KEY") or os.getenv("DOC_INTEL_KEY")
+        if doc_intel_endpoint and doc_intel_key:
+            try:
+                from azure.ai.documentintelligence import DocumentIntelligenceClient  # type: ignore
+                from azure.ai.documentintelligence.models import AnalyzeDocumentRequest  # type: ignore
+
+                di_client = DocumentIntelligenceClient(
+                    endpoint=doc_intel_endpoint,
+                    credential=AzureKeyCredential(doc_intel_key),
+                )
+                b64 = base64.b64encode(file_bytes).decode()
+                poller = di_client.begin_analyze_document(
+                    "prebuilt-read",
+                    AnalyzeDocumentRequest(bytes_source=b64),
+                )
+                result = poller.result()
+                doc_intel_text = (result.content or "").strip()
+                if doc_intel_text:
+                    print(f"[PDF] Document Intelligence OCR succeeded for {filename}", file=sys.stderr)
+                    return doc_intel_text
+                print(f"[PDF] Document Intelligence returned no text for {filename}; falling back to Tesseract", file=sys.stderr)
+            except Exception as di_err:
+                print(f"[PDF] Document Intelligence failed for {filename}: {di_err}; falling back to Tesseract", file=sys.stderr)
 
         reader = PdfReader(io.BytesIO(file_bytes))
         page_count = len(reader.pages)

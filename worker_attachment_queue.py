@@ -26,6 +26,11 @@ QUEUE_NAME = os.getenv("ATTACHMENT_QUEUE_NAME", "attachment-jobs")
 POLL_SECONDS = int(os.getenv("ATTACHMENT_QUEUE_POLL_SECONDS", "3"))
 VISIBILITY_TIMEOUT = int(os.getenv("ATTACHMENT_QUEUE_VISIBILITY_TIMEOUT", "600"))
 
+# Set ATTACHMENT_WORKER_SINGLETON=false to allow multiple worker instances to process
+# the queue concurrently (useful when scaled out). The queue's visibility_timeout already
+# prevents duplicate processing of the same message.
+_SINGLETON_MODE = os.getenv("ATTACHMENT_WORKER_SINGLETON", "true").lower() != "false"
+
 _LEASE_CONTAINER = os.getenv("ATTACHMENT_LEASE_CONTAINER", "attachment-locks")
 _LEASE_BLOB = os.getenv("ATTACHMENT_LEASE_BLOB", "queue-worker.lock")
 _LEASE_DURATION = 60       # Azure max is 60s; renewed every 30s
@@ -117,7 +122,40 @@ def _acquire_lease(blob: BlobClient):
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_queue_loop(stop: threading.Event) -> None:
+    """Poll the queue and process messages until stop is set."""
+    q = _get_queue_client()
+    while not stop.is_set():
+        try:
+            messages = q.receive_messages(
+                messages_per_page=1,
+                visibility_timeout=VISIBILITY_TIMEOUT,
+            ).by_page()
+
+            found = False
+            for page in messages:
+                for msg in page:
+                    found = True
+                    try:
+                        payload = json.loads(msg.content)
+                        _handle_message(payload)
+                        q.delete_message(msg)
+                    except Exception as e:
+                        print(f"[QueueWorker] Message failed: {e}", file=sys.stderr)
+            if not found:
+                time.sleep(POLL_SECONDS)
+        except Exception as e:
+            print(f"[QueueWorker] Loop error: {e}", file=sys.stderr)
+            time.sleep(POLL_SECONDS)
+
+
 def main() -> None:
+    if not _SINGLETON_MODE:
+        print(f"[QueueWorker] Singleton disabled — listening queue={QUEUE_NAME}", file=sys.stderr)
+        stop = threading.Event()
+        _run_queue_loop(stop)
+        return
+
     blob = _get_lock_blob()
 
     while True:
@@ -133,29 +171,7 @@ def main() -> None:
         renewer.start()
 
         try:
-            q = _get_queue_client()
-            while not stop.is_set():
-                try:
-                    messages = q.receive_messages(
-                        messages_per_page=1,
-                        visibility_timeout=VISIBILITY_TIMEOUT,
-                    ).by_page()
-
-                    found = False
-                    for page in messages:
-                        for msg in page:
-                            found = True
-                            try:
-                                payload = json.loads(msg.content)
-                                _handle_message(payload)
-                                q.delete_message(msg)
-                            except Exception as e:
-                                print(f"[QueueWorker] Message failed: {e}", file=sys.stderr)
-                    if not found:
-                        time.sleep(POLL_SECONDS)
-                except Exception as e:
-                    print(f"[QueueWorker] Loop error: {e}", file=sys.stderr)
-                    time.sleep(POLL_SECONDS)
+            _run_queue_loop(stop)
         finally:
             stop.set()
             try:
