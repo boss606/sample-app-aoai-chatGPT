@@ -258,6 +258,34 @@ ATTACHMENT_QUEUE_NAME = os.getenv("ATTACHMENT_QUEUE_NAME", "attachment-jobs")
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 print("AZURE_OPENAI_EMBEDDING_DEPLOYMENT present:", bool(deployment_name))
 
+# ---------------------------------------------------------------------------
+# Module-level singletons — created once at startup, reused across requests.
+# Avoids per-request HTTP client instantiation (~20-80ms overhead each call).
+# ---------------------------------------------------------------------------
+_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+_OPENAI_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+_SEARCH_SERVICE = os.getenv("AZURE_SEARCH_SERVICE")
+_SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX")
+_SEARCH_KEY_VAL = os.getenv("AZURE_SEARCH_KEY")
+
+_openai_sync: Optional[AzureOpenAI] = (
+    AzureOpenAI(api_key=_OPENAI_KEY, azure_endpoint=_OPENAI_ENDPOINT, api_version=_OPENAI_VERSION)
+    if _OPENAI_KEY and _OPENAI_ENDPOINT else None
+)
+_openai_async: Optional[AsyncAzureOpenAI] = (
+    AsyncAzureOpenAI(api_key=_OPENAI_KEY, azure_endpoint=_OPENAI_ENDPOINT, api_version=_OPENAI_VERSION)
+    if _OPENAI_KEY and _OPENAI_ENDPOINT else None
+)
+_search_singleton: Optional[SearchClient] = (
+    SearchClient(
+        f"https://{_SEARCH_SERVICE}.search.windows.net",
+        _SEARCH_INDEX_NAME,
+        AzureKeyCredential(_SEARCH_KEY_VAL),
+    )
+    if _SEARCH_SERVICE and _SEARCH_INDEX_NAME and _SEARCH_KEY_VAL else None
+)
+
 def _search_one_domain_sync(
     search_client: SearchClient,
     query: str,
@@ -382,23 +410,35 @@ async def run_multi_domain_search_async(
     max_domains: int,
     top_per_domain: int,
     embed_client: Optional["AzureOpenAI"] = None,
+    async_embed_client: Optional[AsyncAzureOpenAI] = None,
 ):
     """
     Async version: embedding and domain searches run via thread pool (no event loop blocking).
     Domain searches run in parallel; results merged in deterministic domain order for quality.
+    Prefers async_embed_client (true async, no thread overhead) over sync embed_client.
     """
     candidates = [d.strip() for d in domains if d.strip()][:max_domains]
     query_vector = None
 
-    if embed_client and EMBEDDING_DEPLOYMENT and query.strip():
+    if EMBEDDING_DEPLOYMENT and query.strip():
         try:
-            emb = await asyncio.to_thread(
-                embed_client.embeddings.create,
-                model=EMBEDDING_DEPLOYMENT,
-                input=[query.strip()[:8000]],
-                dimensions=VECTOR_DIMENSION,
-            )
-            query_vector = emb.data[0].embedding
+            if async_embed_client:
+                emb = await async_embed_client.embeddings.create(
+                    model=EMBEDDING_DEPLOYMENT,
+                    input=[query.strip()[:8000]],
+                    dimensions=VECTOR_DIMENSION,
+                )
+            elif embed_client:
+                emb = await asyncio.to_thread(
+                    embed_client.embeddings.create,
+                    model=EMBEDDING_DEPLOYMENT,
+                    input=[query.strip()[:8000]],
+                    dimensions=VECTOR_DIMENSION,
+                )
+            else:
+                emb = None
+            if emb:
+                query_vector = emb.data[0].embedding
         except Exception as e:
             print(f"Embedding error (fallback to keyword only): {e}", file=sys.stderr)
 
@@ -2203,8 +2243,12 @@ async def _stream_with_tools_to_queue_async(
         "tool_calls": tool_calls_list,
     })
 
-    for tc in tool_calls_list:
-        tool_result = await execute_tool(tc["function"]["name"], json.loads(tc["function"]["arguments"]), graph_token, None)
+    # Execute all tool calls in parallel — each M365 call is independent
+    tool_results = await asyncio.gather(*[
+        execute_tool(tc["function"]["name"], json.loads(tc["function"]["arguments"]), graph_token, None)
+        for tc in tool_calls_list
+    ])
+    for tc, tool_result in zip(tool_calls_list, tool_results):
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
 
     # Stream 2nd response after tool execution
@@ -2234,30 +2278,17 @@ async def _execute_agentic_logic(
     context = data.get("context", "")
     print(f"Messages after parsing: {len(messages)}", file=sys.stderr)
 
-    key = os.getenv("AZURE_OPENAI_KEY")
-    raw_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
     search_service = os.getenv("AZURE_SEARCH_SERVICE")
     search_index = os.getenv("AZURE_SEARCH_INDEX")
     search_key = os.getenv("AZURE_SEARCH_KEY")
-    endpoint = raw_endpoint
-    version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 
-    if not key or not endpoint:
+    if not _openai_sync or not _openai_async:
         raise HTTPException(status_code=500, detail="Azure OpenAI not configured")
 
-    print("Creating AzureOpenAI client...", file=sys.stderr)
-    client = AzureOpenAI(
-        api_key=key,
-        azure_endpoint=endpoint,
-        api_version=version,
-    )
-    async_client = AsyncAzureOpenAI(
-        api_key=key,
-        azure_endpoint=endpoint,
-        api_version=version,
-    )
-    print("Client created, making request...", file=sys.stderr)
+    # Reuse module-level singletons — no per-request client instantiation
+    client = _openai_sync
+    async_client = _openai_async
 
     free_mode = data.get("free_mode")
     if free_mode:
@@ -2293,72 +2324,53 @@ async def _execute_agentic_logic(
         context_chunks = []
         no_context = False
         attachment_contexts: List[str] = []
-        search_client = None
-        if search_service and search_index and search_key:
-            search_endpoint = f"https://{search_service}.search.windows.net"
-            search_client = SearchClient(
-                search_endpoint, search_index, AzureKeyCredential(search_key)
-            )
+        # Use module-level singleton — avoids creating a new HTTP client per request
+        search_client = _search_singleton
+
+        # --- Fire legal search early as an async task ---
+        # Runs concurrently with blob validation below, saving sequential wait time.
+        legal_search_task = None
+        t0_search = 0.0
         if search_client and search_query:
-            try:
-                request_domains = data.get("domains", [])
-                if isinstance(request_domains, str):
-                    request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
-                elif not isinstance(request_domains, list):
-                    request_domains = []
-
-                candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
-                candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
-                search_query = normalize_to_text(search_query)
-
-                t0 = time.perf_counter()
-                print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
-                context_chunks, domains_with_hits = await run_multi_domain_search_async(
+            request_domains = data.get("domains", [])
+            if isinstance(request_domains, str):
+                request_domains = [d.strip() for d in request_domains.split(",") if d.strip()]
+            elif not isinstance(request_domains, list):
+                request_domains = []
+            candidates = request_domains or j_config.get("domains") or LEGAL_DOMAINS
+            candidates = [d for d in candidates if d][:LEGAL_MAX_DOMAINS]
+            search_query = normalize_to_text(search_query)
+            t0_search = time.perf_counter()
+            print(f"Running hybrid search for query='{search_query[:80]}...' domains={candidates}", file=sys.stderr)
+            legal_search_task = asyncio.create_task(
+                run_multi_domain_search_async(
                     search_client=search_client,
                     query=search_query,
                     domains=candidates,
                     max_domains=LEGAL_MAX_DOMAINS,
                     top_per_domain=LEGAL_TOP_PER_DOMAIN,
-                    embed_client=client,
+                    async_embed_client=async_client,
                 )
-                print(f"[perf] run_multi_domain_search: {time.perf_counter() - t0:.2f}s", file=sys.stderr)
-
-                legal_mode = len(context_chunks) > 0
-                print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
-                if legal_mode:
-                    ctx = "\n\n".join(context_chunks)
-                    pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
-                    chat_messages.append({
-                        "role": "user",
-                        "content": (
-                            pref
-                            + "Use the context below (tagged by DOMAIN). Cite the sources. "
-                            "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
-                            + ctx
-                        )
-                    })
-                    print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
-                else:
-                    no_context = True
-                    print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
-            except Exception as search_err:
-                print(f"Legal RAG search error: {search_err}", file=sys.stderr)
+            )
         else:
             print("Legal RAG not applied (missing search config or empty question)", file=sys.stderr)
 
+        # --- Blob validation (runs while legal_search_task is in flight) ---
+        full_text_blobs: List[dict] = []
+        rag_blob_names: List[str] = []
         if blobs:
             blobs_with_job = [b for b in blobs if b.get("job_id")]
             blobs_without_job = [b for b in blobs if not b.get("job_id")]
             if blobs_without_job:
                 names = [b.get("original_filename", "file") for b in blobs_without_job]
+                if legal_search_task:
+                    legal_search_task.cancel()
                 raise HTTPException(
                     status_code=400,
                     detail=f"File(s) '{', '.join(names)}' were not processed. Remove and re-upload to process in the background.",
                 )
             processing_names = []
             failed_jobs = []
-            full_text_blobs: List[dict] = []
-            rag_blob_names: List[str] = []
             record_status_lines: List[str] = []
             for b in blobs_with_job:
                 att_job_id = b.get("job_id")
@@ -2384,9 +2396,13 @@ async def _execute_agentic_logic(
                 else:
                     processing_names.append(orig)
             if processing_names:
+                if legal_search_task:
+                    legal_search_task.cancel()
                 msg = f"Document(s) still processing: {', '.join(processing_names)}. Please wait a few seconds and try again."
                 raise HTTPException(status_code=400, detail=msg)
             if failed_jobs:
+                if legal_search_task:
+                    legal_search_task.cancel()
                 err_parts = [f"{n}: {e}" for n, e in failed_jobs]
                 raise HTTPException(status_code=400, detail=f"Attachment processing failed: {'; '.join(err_parts)}")
 
@@ -2413,31 +2429,86 @@ async def _execute_agentic_logic(
                 )
                 chat_messages.insert(1, {"role": "user", "content": record_status_block})
 
-            if full_text_blobs:
-                try:
-                    t0_ft = time.perf_counter()
-                    ft_sections = await _fetch_full_text_context(full_text_blobs)
-                    if ft_sections:
-                        attachment_contexts.extend(ft_sections)
-                    print(f"[perf] _fetch_full_text_context: {time.perf_counter() - t0_ft:.2f}s for {len(full_text_blobs)} blob(s)", file=sys.stderr)
-                except Exception as ft_err:
-                    print(f"[UserAttachment] Full-text fetch error: {ft_err}", file=sys.stderr)
-            if rag_blob_names and search_client:
-                try:
-                    t0_attach = time.perf_counter()
-                    attach_chunks = await run_user_attachment_search_async(
-                        search_client=search_client,
-                        query=search_query or "legal",
-                        blob_names=rag_blob_names,
-                        top_k=6,
-                        embed_client=client,
-                    )
-                    print(f"[perf] run_user_attachment_search: {time.perf_counter() - t0_attach:.2f}s", file=sys.stderr)
-                    if attach_chunks:
-                        attachment_contexts.extend(attach_chunks)
-                    print(f"[UserAttachment] RAG hit {len(attach_chunks)} chunks for {len(rag_blob_names)} blob(s)", file=sys.stderr)
-                except Exception as ua_err:
-                    print(f"[UserAttachment] Search error: {ua_err}", file=sys.stderr)
+        # --- Fire attachment tasks now that we know what to fetch ---
+        # These run in parallel with each other and overlap with legal_search_task.
+        ft_task = (
+            asyncio.create_task(_fetch_full_text_context(full_text_blobs))
+            if full_text_blobs else None
+        )
+        rag_task = (
+            asyncio.create_task(
+                run_user_attachment_search_async(
+                    search_client=search_client,
+                    query=search_query or "legal",
+                    blob_names=rag_blob_names,
+                    top_k=6,
+                    embed_client=client,
+                )
+            )
+            if rag_blob_names and search_client else None
+        )
+
+        # --- Single gather: legal search + attachment fetches run in parallel ---
+        _ptasks: list = []
+        _pkeys: list = []
+        for _k, _t in [("legal", legal_search_task), ("ft", ft_task), ("rag", rag_task)]:
+            if _t is not None:
+                _ptasks.append(_t)
+                _pkeys.append(_k)
+        if _ptasks:
+            _presults = await asyncio.gather(*_ptasks, return_exceptions=True)
+            task_results = dict(zip(_pkeys, _presults))
+        else:
+            task_results = {}
+
+        # --- Apply results to prompt IN ORDER: legal context first, attachments after ---
+
+        # Legal context
+        if "legal" in task_results:
+            legal_result = task_results["legal"]
+            if isinstance(legal_result, Exception):
+                print(f"Legal RAG search error: {legal_result}", file=sys.stderr)
+            else:
+                context_chunks, domains_with_hits = legal_result
+                print(f"[perf] run_multi_domain_search: {time.perf_counter() - t0_search:.2f}s", file=sys.stderr)
+                legal_mode = len(context_chunks) > 0
+                print(f"Legal mode via search hits: {legal_mode} (domains_with_hits={domains_with_hits} chunks={len(context_chunks)})", file=sys.stderr)
+                if legal_mode:
+                    ctx = "\n\n".join(context_chunks)
+                    pref = "When the user has attachments, treat them as the primary source; use the context below only if relevant to the attachment's topic.\n\n" if blobs else ""
+                    chat_messages.append({
+                        "role": "user",
+                        "content": (
+                            pref
+                            + "Use the context below (tagged by DOMAIN). Cite the sources. "
+                            "Reuse and expand upon prior conversation content when the user asks for more details, expansion, or revision.\n"
+                            + ctx
+                        )
+                    })
+                    print(f"Legal RAG applied with {len(context_chunks)} chunk(s)", file=sys.stderr)
+                else:
+                    no_context = True
+                    print("Legal RAG skipped (no relevant search hits)", file=sys.stderr)
+
+        # Full-text attachment context
+        if "ft" in task_results:
+            ft_result = task_results["ft"]
+            if isinstance(ft_result, Exception):
+                print(f"[UserAttachment] Full-text fetch error: {ft_result}", file=sys.stderr)
+            else:
+                if ft_result:
+                    attachment_contexts.extend(ft_result)
+                print(f"[perf] _fetch_full_text_context: done for {len(full_text_blobs)} blob(s)", file=sys.stderr)
+
+        # RAG attachment context
+        if "rag" in task_results:
+            rag_result = task_results["rag"]
+            if isinstance(rag_result, Exception):
+                print(f"[UserAttachment] Search error: {rag_result}", file=sys.stderr)
+            else:
+                if rag_result:
+                    attachment_contexts.extend(rag_result)
+                print(f"[UserAttachment] RAG hit {len(rag_result) if rag_result else 0} chunks for {len(rag_blob_names)} blob(s)", file=sys.stderr)
 
         if attachment_contexts:
             no_context = False
