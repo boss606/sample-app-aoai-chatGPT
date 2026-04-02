@@ -1069,6 +1069,38 @@ async function addSelectedToChat() {
 
 // --- FILE ATTACHMENT HANDLING ---
 
+async function expandZip(zipFile) {
+    var statusId = addLoading('Extracting ' + zipFile.name + '...');
+    try {
+        var zip = await JSZip.loadAsync(zipFile);
+        var result = [];
+        var entries = Object.values(zip.files).filter(function(e) {
+            if (e.dir) return false;
+            var name = e.name.split('/').pop();
+            var ext = (name || '').split('.').pop().toLowerCase();
+            return ext === 'pdf' || ext === 'docx';
+        });
+        if (entries.length === 0) {
+            addMessage('ZIP "' + zipFile.name + '" does not contain any PDF or DOCX files.', 'system-error');
+            return [];
+        }
+        for (var entry of entries) {
+            var blob = await entry.async('blob');
+            var name = entry.name.split('/').pop();
+            var type = name.toLowerCase().endsWith('.pdf')
+                ? 'application/pdf'
+                : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            result.push(new File([blob], name, { type: type }));
+        }
+        return result;
+    } catch (e) {
+        addMessage('Failed to extract "' + zipFile.name + '": ' + e.message, 'system-error');
+        return [];
+    } finally {
+        removeMessage(statusId);
+    }
+}
+
 async function handleFileSelect(event) {
     var files = event.target.files;
     if (!files || files.length === 0) return;
@@ -1078,8 +1110,21 @@ async function handleFileSelect(event) {
     updateSendButtonState();
 
     try {
-    for (var i = 0; i < files.length; i++) {
-        var file = files[i];
+        // Expand any ZIP files into their individual PDF/DOCX contents
+        var filesToProcess = [];
+        for (var i = 0; i < files.length; i++) {
+            var f = files[i];
+            var fext = (f.name || '').split('.').pop().toLowerCase();
+            if (fext === 'zip') {
+                var extracted = await expandZip(f);
+                filesToProcess = filesToProcess.concat(extracted);
+            } else {
+                filesToProcess.push(f);
+            }
+        }
+
+    for (var i = 0; i < filesToProcess.length; i++) {
+        var file = filesToProcess[i];
         var ext = (file.name || '').split('.').pop().toLowerCase();
         if (ext !== 'pdf' && ext !== 'docx') {
             addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
