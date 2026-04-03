@@ -58,7 +58,7 @@ jobs:
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
             --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
-                       POST_BUILD_COMMAND="pip install websockets==14.2" \
+                       POST_BUILD_COMMAND="pip install websockets==14.2 && cp -rf \$DEPLOYMENT_SOURCE/templates/ \$DEPLOYMENT_TARGET/templates/" \
             --output none
           az webapp config appsettings delete --name Joogni-West --resource-group GLG-AI \
             --setting-names POST_BUILD_SCRIPT_PATH --output none 2>/dev/null || true
@@ -75,16 +75,3 @@ jobs:
           slot-name: 'Production'
           package: .
 
-      - name: Push templates directly to wwwroot via Azure REST API (bypass Oryx cache)
-        run: |
-          SUB=$(az account show --query id -o tsv)
-          BASE="https://management.azure.com/subscriptions/$SUB/resourceGroups/GLG-AI/providers/Microsoft.Web/sites/Joogni-West/hostruntime/admin/vfs"
-
-          find templates/ -type f | while read f; do
-            HTTP_CODE=$(az rest --method PUT \
-              --uri "$BASE/site/wwwroot/$f?api-version=2022-03-01" \
-              --headers "Content-Type=text/html" "If-Match=*" \
-              --body @"$f" \
-              --output none 2>&1; echo $?)
-            echo "$f → exit $HTTP_CODE"
-          done
