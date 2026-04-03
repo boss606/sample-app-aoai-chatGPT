@@ -86,7 +86,7 @@ if os.path.isdir("/home/site/wwwroot/templates"):
     templates_dir = "/home/site/wwwroot/templates"
 elif os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")):
     templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
-templates = Jinja2Templates(directory=templates_dir)
+templates = Jinja2Templates(directory=templates_dir, auto_reload=True)
 
 # ============== Multi-Jurisdiction Registry ==============
 # Display name (from dropdown) -> internal jurisdiction id

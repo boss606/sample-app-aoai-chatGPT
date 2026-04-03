@@ -29,6 +29,11 @@ jobs:
         run: |
           echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
+      - name: Verify critical files are present in artifact
+        run: |
+          grep -q "jszip" templates/index.html && echo "templates/index.html OK" || (echo "ERROR: templates/index.html missing jszip" && exit 1)
+          test -f static/jszip.min.js && echo "static/jszip.min.js OK" || (echo "ERROR: static/jszip.min.js missing" && exit 1)
+
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
