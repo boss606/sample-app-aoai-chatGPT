@@ -1690,7 +1690,11 @@ async function pollForResult(jobId, maxAttempts, interval) {
 function addMessage(text, type, isMarkdown) {
     var container = document.getElementById('chat-container');
     if (!container) return;
-    
+
+    // Hide welcome screen on first message
+    var welcomeScreen = document.getElementById('welcome-screen');
+    if (welcomeScreen) welcomeScreen.style.display = 'none';
+
     var div = document.createElement('div');
     
     var messageClass = type === 'user' ? 'message-user' : type === 'system-error' ? 'message-system message-error' : 'message-system';
