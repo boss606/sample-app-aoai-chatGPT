@@ -28,6 +28,198 @@ var boxAuthWindow = null;
 var boxBreadcrumbs = [{id: '0', name: 'All Files'}];
 var boxCurrentFolder = '0';
 
+// ============================================================
+// CHAT HISTORY (localStorage, 30-day TTL, per-user toggle)
+// ============================================================
+var HISTORY_KEY = 'joogni_chat_history';
+var HISTORY_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+var currentConversationId = null;
+
+function _loadHistoryStore() {
+    try {
+        var raw = localStorage.getItem(HISTORY_KEY);
+        if (!raw) return { enabled: true, conversations: [] };
+        return JSON.parse(raw);
+    } catch(e) { return { enabled: true, conversations: [] }; }
+}
+
+function _saveHistoryStore(store) {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(store)); } catch(e) {}
+}
+
+function _pruneExpired(store) {
+    var cutoff = Date.now() - HISTORY_TTL_MS;
+    store.conversations = store.conversations.filter(function(c) {
+        return c.updatedAt > cutoff;
+    });
+    return store;
+}
+
+function isHistoryEnabled() {
+    return _loadHistoryStore().enabled !== false;
+}
+
+function onHistoryToggle(enabled) {
+    var store = _loadHistoryStore();
+    store.enabled = enabled;
+    _saveHistoryStore(store);
+    renderSidebar();
+}
+
+function openSettings() {
+    var modal = document.getElementById('settings-modal');
+    if (modal) modal.classList.remove('hidden');
+    var toggle = document.getElementById('history-toggle');
+    if (toggle) toggle.checked = isHistoryEnabled();
+}
+
+function closeSettings() {
+    var modal = document.getElementById('settings-modal');
+    if (modal) modal.classList.add('hidden');
+}
+
+function clearAllHistory() {
+    if (!confirm('Clear all saved conversations? This cannot be undone.')) return;
+    var store = _loadHistoryStore();
+    store.conversations = [];
+    currentConversationId = null;
+    _saveHistoryStore(store);
+    renderSidebar();
+    closeSettings();
+}
+
+function _generateId() {
+    return 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function _titleFromMessage(text) {
+    var t = text.replace(/\s+/g, ' ').trim();
+    return t.length > 50 ? t.slice(0, 50) + '…' : t;
+}
+
+function _timeAgo(ts) {
+    var diff = Date.now() - ts;
+    var m = Math.floor(diff / 60000);
+    if (m < 1) return 'Just now';
+    if (m < 60) return m + ' min ago';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h === 1 ? '1 hour ago' : h + ' hours ago';
+    var d = Math.floor(h / 24);
+    if (d === 1) return 'Yesterday';
+    if (d < 7) return d + ' days ago';
+    return new Date(ts).toLocaleDateString();
+}
+
+function saveCurrentConversation() {
+    if (!isHistoryEnabled()) return;
+    if (messageHistory.length === 0) return;
+
+    var store = _pruneExpired(_loadHistoryStore());
+
+    if (currentConversationId) {
+        var existing = store.conversations.find(function(c) { return c.id === currentConversationId; });
+        if (existing) {
+            existing.messages = messageHistory.slice();
+            existing.updatedAt = Date.now();
+            _saveHistoryStore(store);
+            renderSidebar();
+            return;
+        }
+    }
+
+    // New conversation
+    var firstUserMsg = messageHistory.find(function(m) { return m.role === 'user'; });
+    var title = firstUserMsg ? _titleFromMessage(firstUserMsg.content) : 'New conversation';
+    var conv = {
+        id: _generateId(),
+        title: title,
+        messages: messageHistory.slice(),
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+    };
+    currentConversationId = conv.id;
+    store.conversations.unshift(conv);
+    _saveHistoryStore(store);
+    renderSidebar();
+}
+
+function loadConversation(convId) {
+    var store = _loadHistoryStore();
+    var conv = store.conversations.find(function(c) { return c.id === convId; });
+    if (!conv) return;
+
+    // Clear current chat UI
+    var container = document.getElementById('chat-container');
+    if (container) {
+        var welcome = container.querySelector('#welcome-screen');
+        container.innerHTML = '';
+        if (welcome) container.appendChild(welcome);
+    }
+    if (container) {
+        var ws = document.getElementById('welcome-screen');
+        if (ws) ws.style.display = 'none';
+    }
+
+    // Load messages into UI
+    messageHistory = [];
+    clearAllAttachments();
+    conv.messages.forEach(function(msg) {
+        messageHistory.push({ role: msg.role, content: msg.content });
+        if (msg.role === 'user') {
+            addMessage(msg.content, 'user');
+        } else if (msg.role === 'assistant') {
+            addMessage(msg.content, 'system', true);
+        }
+    });
+
+    currentConversationId = convId;
+    renderSidebar();
+}
+
+function deleteConversation(convId, event) {
+    if (event) event.stopPropagation();
+    var store = _pruneExpired(_loadHistoryStore());
+    store.conversations = store.conversations.filter(function(c) { return c.id !== convId; });
+    _saveHistoryStore(store);
+    if (currentConversationId === convId) {
+        newConversation();
+    } else {
+        renderSidebar();
+    }
+}
+
+function renderSidebar() {
+    var container = document.getElementById('sb-conversations');
+    if (!container) return;
+
+    var store = _pruneExpired(_loadHistoryStore());
+
+    if (!store.enabled || store.conversations.length === 0) {
+        var msg = !store.enabled
+            ? 'Chat history is disabled.<br>Enable it in Settings.'
+            : 'No conversations yet.<br>Start chatting to save history.';
+        container.innerHTML = '<div class="sb-empty">' + msg + '</div>';
+        return;
+    }
+
+    var html = '';
+    store.conversations.forEach(function(conv) {
+        var isActive = conv.id === currentConversationId;
+        html += '<div class="sb-conv-item' + (isActive ? ' active' : '') + '" onclick="loadConversation(\'' + conv.id + '\')">'
+            + '<div class="sb-conv-content">'
+            + '<div class="sb-conv-title">' + escapeHtml(conv.title) + '</div>'
+            + '<div class="sb-conv-time">' + _timeAgo(conv.updatedAt) + '</div>'
+            + '</div>'
+            + '<button class="sb-conv-delete" onclick="deleteConversation(\'' + conv.id + '\', event)" title="Delete">'
+            + '<i class="fas fa-times"></i>'
+            + '</button>'
+            + '</div>';
+    });
+    container.innerHTML = html;
+}
+
+// ============================================================
+
 console.log('Joogni script loaded');
 
 /** Safely parse JSON from a fetch Response. Throws with a clear message if body is empty or invalid. */
@@ -138,6 +330,7 @@ document.addEventListener('DOMContentLoaded', function() {
     checkBoxStatus();
     loadUserInfo();
     updateSendButtonState();
+    renderSidebar();
     // Allow ZIP selection in the file picker (handled entirely in JS — no HTML change needed)
     var fileInput = document.getElementById('file-input');
     if (fileInput) {
@@ -175,6 +368,18 @@ async function loadUserInfo() {
             }
             userNameEl.textContent = displayName;
             userNameEl.title = data.email || ''; // Show full email on hover
+
+            // Update sidebar user area
+            var sbName = document.getElementById('sb-user-name');
+            if (sbName) sbName.textContent = displayName;
+            var sbInitials = document.getElementById('sb-user-initials');
+            if (sbInitials) {
+                var parts = displayName.split(' ');
+                var initials = parts.length >= 2
+                    ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+                    : displayName.slice(0, 2).toUpperCase();
+                sbInitials.textContent = initials;
+            }
         }
     } catch (error) {
         console.error('Failed to load user info:', error);
@@ -1425,7 +1630,31 @@ async function clearAllAttachments() {
 
 function startNewConversation() {
     messageHistory = [];
+    currentConversationId = null;
     clearAllAttachments();
+}
+
+function newConversation() {
+    startNewConversation();
+    // Clear chat UI
+    var container = document.getElementById('chat-container');
+    if (container) {
+        container.innerHTML = '';
+        var welcome = document.createElement('div');
+        welcome.id = 'welcome-screen';
+        welcome.className = 'welcome-screen';
+        welcome.innerHTML = '<div class="welcome-avatar">J</div>'
+            + '<h2 class="welcome-heading">How can I help today?</h2>'
+            + '<p class="welcome-subtext">Ask about California family law, statutes, deadlines, or analyze documents.</p>'
+            + '<div class="welcome-grid">'
+            + '<button class="welcome-card-btn" onclick="usePrompt(\'Summarize key issues in Johnson custody case\')">Summarize key issues in Johnson custody case</button>'
+            + '<button class="welcome-card-btn" onclick="usePrompt(\'What deadlines are coming up this week?\')">What deadlines are coming up this week?</button>'
+            + '<button class="welcome-card-btn" onclick="usePrompt(\'Draft a spousal support argument\')">Draft a spousal support argument</button>'
+            + '<button class="welcome-card-btn" onclick="usePrompt(\'Analyze Income &amp; Expense Declaration\')">Analyze Income &amp; Expense Declaration</button>'
+            + '</div>';
+        container.appendChild(welcome);
+    }
+    renderSidebar();
 }
 
 // --- CHAT FUNCTIONS ---
@@ -1545,6 +1774,7 @@ async function sendMessage() {
         }
         if (fullText) {
             messageHistory.push({ role: 'assistant', content: fullText });
+            saveCurrentConversation();
         }
 
     } catch (error) {
