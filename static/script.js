@@ -305,7 +305,6 @@ async function acceptAgreement() {
         
         if (data.success) {
             hideAgreementModal();
-            addMessage('✅ Terms accepted. Welcome to Joogni!', 'system');
         } else {
             button.innerHTML = '<i class="fas fa-check"></i> Accept & Continue';
             button.disabled = false;

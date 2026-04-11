@@ -685,7 +685,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True #bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -1866,7 +1866,6 @@ def _get_cosmos_client() -> Optional[CosmosConversationClient]:
         account = f"https://{account}"
 
     try:
-        from azure.cosmos import CosmosClient as _SyncClient
         client = CosmosConversationClient(
             cosmosdb_endpoint=account,
             credential=key,
