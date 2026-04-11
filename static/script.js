@@ -1636,8 +1636,12 @@ function startNewConversation() {
     clearAllAttachments();
 }
 
-function newConversation() {
+async function newConversation() {
+    // Render sidebar FIRST (before resetting state) so current conv stays visible
+    await renderSidebar();
+
     startNewConversation();
+
     // Clear chat UI
     var container = document.getElementById('chat-container');
     if (container) {
@@ -1656,7 +1660,6 @@ function newConversation() {
             + '</div>';
         container.appendChild(welcome);
     }
-    renderSidebar();
 }
 
 // --- CHAT FUNCTIONS ---

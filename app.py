@@ -2029,29 +2029,33 @@ async def save_conversation(request: Request):
         messages = data.get("messages", [])
 
         if conv_id:
-            # Update existing: delete old messages and re-insert
             existing = await cosmos.get_conversation(user_id, conv_id)
             if existing:
-                await cosmos.delete_messages(conv_id, user_id)
+                # Update conversation metadata
                 existing["title"] = title
                 existing["updatedAt"] = datetime.utcnow().isoformat()
                 await cosmos.upsert_conversation(existing)
+                # Delete old messages and re-insert updated set
+                await cosmos.delete_messages(conv_id, user_id)
             else:
-                conv_id = None  # fallback: create new
+                # conv_id came from frontend but doesn't exist — create fresh
+                print(f"[history] conv_id {conv_id} not found for {user_id}, creating new", file=sys.stderr)
+                conv_id = None
 
         if not conv_id:
             conv = await cosmos.create_conversation(user_id, title=title)
             conv_id = conv["id"]
 
-        # Insert all messages
-        for msg in messages:
+        # Insert all messages for this conversation
+        for m in messages:
             await cosmos.create_message(
                 uuid=str(uuid.uuid4()),
                 conversation_id=conv_id,
                 user_id=user_id,
-                input_message={"role": msg["role"], "content": msg["content"]}
+                input_message={"role": m["role"], "content": m["content"]}
             )
 
+        print(f"[history] saved conv {conv_id} with {len(messages)} messages for {user_id}", file=sys.stderr)
         return JSONResponse({"success": True, "conversation_id": conv_id})
     except Exception as e:
         print(f"save_conversation error: {e}", file=sys.stderr)
