@@ -1851,8 +1851,15 @@ user_history_settings = {}
 
 # ============== CosmosDB Chat History ==============
 
+# Singleton — created once at startup, reused across all requests
+_cosmos_client_instance: Optional[CosmosConversationClient] = None
+
 def _get_cosmos_client() -> Optional[CosmosConversationClient]:
-    """Initialize CosmosDB client from environment variables. Returns None if not configured."""
+    """Return the shared CosmosDB client. Initializes once on first call."""
+    global _cosmos_client_instance
+    if _cosmos_client_instance is not None:
+        return _cosmos_client_instance
+
     account = os.getenv("AZURE_COSMOSDB_ACCOUNT", "").strip().rstrip("/")
     key = os.getenv("AZURE_COSMOSDB_ACCOUNT_KEY", "").strip()
     database = os.getenv("AZURE_COSMOSDB_DATABASE", "").strip()
@@ -1861,19 +1868,19 @@ def _get_cosmos_client() -> Optional[CosmosConversationClient]:
     if not account or not key or not database:
         return None
 
-    # Normalize endpoint: ensure it starts with https://
     if not account.startswith("http"):
         account = f"https://{account}"
 
     try:
-        client = CosmosConversationClient(
+        _cosmos_client_instance = CosmosConversationClient(
             cosmosdb_endpoint=account,
             credential=key,
             database_name=database,
             container_name=container,
             enable_message_feedback=False,
         )
-        return client
+        print("CosmosDB client initialized", file=sys.stderr)
+        return _cosmos_client_instance
     except Exception as e:
         print(f"CosmosDB init error: {e}", file=sys.stderr)
         return None
@@ -1998,9 +2005,6 @@ async def list_conversations(request: Request):
         return JSONResponse({"conversations": [], "error": "History not configured"})
 
     try:
-        ok, msg = await cosmos.ensure()
-        if not ok:
-            return JSONResponse({"conversations": [], "error": msg})
         conversations = await cosmos.get_conversations(user_id, limit=50, sort_order="DESC")
         return JSONResponse({"conversations": conversations})
     except Exception as e:
@@ -2020,10 +2024,6 @@ async def save_conversation(request: Request):
         return JSONResponse({"error": "History not configured"}, status_code=503)
 
     try:
-        ok, msg = await cosmos.ensure()
-        if not ok:
-            return JSONResponse({"error": msg}, status_code=503)
-
         conv_id = data.get("conversation_id")
         title = data.get("title", "Untitled")
         messages = data.get("messages", [])
@@ -2069,10 +2069,6 @@ async def get_conversation_messages(conversation_id: str, request: Request):
         return JSONResponse({"error": "History not configured"}, status_code=503)
 
     try:
-        ok, msg = await cosmos.ensure()
-        if not ok:
-            return JSONResponse({"error": msg}, status_code=503)
-
         conversation = await cosmos.get_conversation(user_id, conversation_id)
         if not conversation:
             return JSONResponse({"error": "Conversation not found"}, status_code=404)
@@ -2095,10 +2091,6 @@ async def delete_conversation(conversation_id: str, request: Request):
         return JSONResponse({"error": "History not configured"}, status_code=503)
 
     try:
-        ok, msg = await cosmos.ensure()
-        if not ok:
-            return JSONResponse({"error": msg}, status_code=503)
-
         await cosmos.delete_messages(conversation_id, user_id)
         await cosmos.delete_conversation(user_id, conversation_id)
         return JSONResponse({"success": True})
@@ -2118,10 +2110,6 @@ async def clear_all_history(request: Request):
         return JSONResponse({"error": "History not configured"}, status_code=503)
 
     try:
-        ok, msg = await cosmos.ensure()
-        if not ok:
-            return JSONResponse({"error": msg}, status_code=503)
-
         conversations = await cosmos.get_conversations(user_id, limit=None)
         for conv in conversations:
             await cosmos.delete_messages(conv["id"], user_id)

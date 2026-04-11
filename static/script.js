@@ -360,27 +360,26 @@ async function loadUserInfo() {
         var data = await response.json();
         
         var userNameEl = document.getElementById('user-name');
-        if (userNameEl && data.authenticated) {
-            // Show name if available, otherwise show email
-            var displayName = data.name || data.email || 'User';
-            // Shorten email if needed
-            if (!data.name && data.email && data.email.length > 25) {
-                displayName = data.email.split('@')[0];
-            }
-            userNameEl.textContent = displayName;
-            userNameEl.title = data.email || ''; // Show full email on hover
+        var displayName = data.name || data.email || (data.authenticated ? 'User' : 'Local Dev');
+        if (!data.name && data.email && data.email.length > 25) {
+            displayName = data.email.split('@')[0];
+        }
 
-            // Update sidebar user area
-            var sbName = document.getElementById('sb-user-name');
-            if (sbName) sbName.textContent = displayName;
-            var sbInitials = document.getElementById('sb-user-initials');
-            if (sbInitials) {
-                var parts = displayName.split(' ');
-                var initials = parts.length >= 2
-                    ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
-                    : displayName.slice(0, 2).toUpperCase();
-                sbInitials.textContent = initials;
-            }
+        if (userNameEl) {
+            userNameEl.textContent = displayName;
+            userNameEl.title = data.email || '';
+        }
+
+        // Always update sidebar user area
+        var sbName = document.getElementById('sb-user-name');
+        if (sbName) sbName.textContent = displayName;
+        var sbInitials = document.getElementById('sb-user-initials');
+        if (sbInitials) {
+            var parts = displayName.split(' ');
+            var initials = parts.length >= 2
+                ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
+                : displayName.slice(0, 2).toUpperCase();
+            sbInitials.textContent = initials;
         }
     } catch (error) {
         console.error('Failed to load user info:', error);
