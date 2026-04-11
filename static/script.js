@@ -93,8 +93,8 @@ async function clearAllHistory() {
 }
 
 async function saveCurrentConversation() {
-    if (!_historyEnabled) return;
-    if (messageHistory.length === 0) return;
+    if (!_historyEnabled) { console.log('[history] disabled, skipping save'); return; }
+    if (messageHistory.length === 0) { console.log('[history] no messages, skipping save'); return; }
 
     var firstUserMsg = messageHistory.find(function(m) { return m.role === 'user'; });
     var title = firstUserMsg ? _titleFromMessage(firstUserMsg.content) : 'New conversation';
@@ -106,18 +106,20 @@ async function saveCurrentConversation() {
         };
         if (currentConversationId) body.conversation_id = currentConversationId;
 
+        console.log('[history] saving conversation, messages:', messageHistory.length, 'conv_id:', currentConversationId);
         var resp = await fetch('/api/history', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
         var data = await resp.json();
+        console.log('[history] save response:', data);
         if (data.conversation_id) {
             currentConversationId = data.conversation_id;
         }
         renderSidebar();
     } catch(e) {
-        console.warn('Failed to save conversation:', e);
+        console.error('[history] Failed to save conversation:', e);
     }
 }
 
@@ -1774,7 +1776,7 @@ async function sendMessage() {
         }
         if (fullText) {
             messageHistory.push({ role: 'assistant', content: fullText });
-            saveCurrentConversation();
+            await saveCurrentConversation();
         }
 
     } catch (error) {
