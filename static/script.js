@@ -33,7 +33,6 @@ var boxCurrentFolder = '0';
 // ============================================================
 var currentConversationId = null;
 var _historyEnabled = true; // local cache, synced from server on load
-var _cachedConversations = []; // local cache so sidebar is instant after save
 
 function _titleFromMessage(text) {
     var t = text.replace(/\s+/g, ' ').trim();
@@ -94,37 +93,31 @@ async function clearAllHistory() {
 }
 
 async function saveCurrentConversation() {
-    if (!_historyEnabled) return;
-    if (messageHistory.length === 0) return;
+    if (!_historyEnabled) { console.log('[history] disabled, skipping save'); return; }
+    if (messageHistory.length === 0) { console.log('[history] no messages, skipping save'); return; }
 
     var firstUserMsg = messageHistory.find(function(m) { return m.role === 'user'; });
     var title = firstUserMsg ? _titleFromMessage(firstUserMsg.content) : 'New conversation';
-    var now = new Date().toISOString();
 
     try {
-        var body = { title: title, messages: messageHistory };
+        var body = {
+            title: title,
+            messages: messageHistory,
+        };
         if (currentConversationId) body.conversation_id = currentConversationId;
 
+        console.log('[history] saving conversation, messages:', messageHistory.length, 'conv_id:', currentConversationId);
         var resp = await fetch('/api/history', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
         var data = await resp.json();
+        console.log('[history] save response:', data);
         if (data.conversation_id) {
             currentConversationId = data.conversation_id;
-            // Update local cache immediately so sidebar is instant
-            var idx = _cachedConversations.findIndex(function(c) { return c.id === currentConversationId; });
-            var entry = { id: currentConversationId, title: title, updatedAt: now, createdAt: now };
-            if (idx >= 0) {
-                _cachedConversations[idx] = Object.assign(_cachedConversations[idx], { title: title, updatedAt: now });
-            } else {
-                _cachedConversations.unshift(entry);
-            }
         }
-        _renderSidebarFromCache();
-        // Refresh from API in background to stay in sync
-        _fetchAndRefreshSidebar();
+        renderSidebar();
     } catch(e) {
         console.error('[history] Failed to save conversation:', e);
     }
@@ -172,21 +165,19 @@ async function loadConversation(convId) {
 
 async function deleteConversation(convId, event) {
     if (event) event.stopPropagation();
-    // Remove from cache immediately for instant UI response
-    _cachedConversations = _cachedConversations.filter(function(c) { return c.id !== convId; });
-    _renderSidebarFromCache();
     try {
         await fetch('/api/history/' + convId, { method: 'DELETE' });
         if (currentConversationId === convId) {
             newConversation();
+        } else {
+            renderSidebar();
         }
     } catch(e) {
         console.warn('Failed to delete conversation:', e);
-        _fetchAndRefreshSidebar(); // re-sync on error
     }
 }
 
-function _renderSidebarFromCache() {
+async function renderSidebar() {
     var container = document.getElementById('sb-conversations');
     if (!container) return;
 
@@ -195,43 +186,34 @@ function _renderSidebarFromCache() {
         return;
     }
 
-    if (_cachedConversations.length === 0) {
-        container.innerHTML = '<div class="sb-empty">No conversations yet.<br>Start chatting to save history.</div>';
-        return;
-    }
-
-    var html = '';
-    _cachedConversations.forEach(function(conv) {
-        var isActive = conv.id === currentConversationId;
-        var updatedAt = conv.updatedAt || conv.createdAt || '';
-        html += '<div class="sb-conv-item' + (isActive ? ' active' : '') + '" onclick="loadConversation(\'' + conv.id + '\')">'
-            + '<div class="sb-conv-content">'
-            + '<div class="sb-conv-title">' + escapeHtml(conv.title || 'Untitled') + '</div>'
-            + '<div class="sb-conv-time">' + _timeAgo(updatedAt) + '</div>'
-            + '</div>'
-            + '<button class="sb-conv-delete" onclick="deleteConversation(\'' + conv.id + '\', event)" title="Delete">'
-            + '<i class="fas fa-times"></i>'
-            + '</button>'
-            + '</div>';
-    });
-    container.innerHTML = html;
-}
-
-async function _fetchAndRefreshSidebar() {
     try {
         var resp = await fetch('/api/history');
         var data = await resp.json();
         var conversations = data.conversations || [];
-        if (conversations.length > 0 || _cachedConversations.length === 0) {
-            _cachedConversations = conversations;
-            _renderSidebarFromCache();
-        }
-    } catch(e) { /* keep showing cache on network error */ }
-}
 
-async function renderSidebar() {
-    _renderSidebarFromCache();
-    await _fetchAndRefreshSidebar();
+        if (conversations.length === 0) {
+            container.innerHTML = '<div class="sb-empty">No conversations yet.<br>Start chatting to save history.</div>';
+            return;
+        }
+
+        var html = '';
+        conversations.forEach(function(conv) {
+            var isActive = conv.id === currentConversationId;
+            var updatedAt = conv.updatedAt || conv.createdAt || '';
+            html += '<div class="sb-conv-item' + (isActive ? ' active' : '') + '" onclick="loadConversation(\'' + conv.id + '\')">'
+                + '<div class="sb-conv-content">'
+                + '<div class="sb-conv-title">' + escapeHtml(conv.title || 'Untitled') + '</div>'
+                + '<div class="sb-conv-time">' + _timeAgo(updatedAt) + '</div>'
+                + '</div>'
+                + '<button class="sb-conv-delete" onclick="deleteConversation(\'' + conv.id + '\', event)" title="Delete">'
+                + '<i class="fas fa-times"></i>'
+                + '</button>'
+                + '</div>';
+        });
+        container.innerHTML = html;
+    } catch(e) {
+        container.innerHTML = '<div class="sb-empty">Could not load history.</div>';
+    }
 }
 
 // ============================================================
