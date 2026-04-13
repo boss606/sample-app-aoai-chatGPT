@@ -52,9 +52,9 @@ jobs:
           echo "=== Static files in zip ==="
           unzip -l release.zip | grep -E "static/" || (echo "ERROR: no static in zip" && exit 1)
           echo "=== App entrypoint in zip ==="
-          unzip -l release.zip | grep -E "(^|/)app\.py" || (echo "ERROR: app.py missing" && exit 1)
+          unzip -p release.zip app.py > /dev/null 2>&1 && echo "app.py OK" || (echo "ERROR: app.py missing" && exit 1)
           echo "=== Deploy marker in zip ==="
-          unzip -l release.zip | grep "DEPLOY_SHA.txt" || (echo "ERROR: DEPLOY_SHA.txt missing" && exit 1)
+          unzip -p release.zip DEPLOY_SHA.txt > /dev/null 2>&1 && echo "DEPLOY_SHA.txt OK ($(unzip -p release.zip DEPLOY_SHA.txt))" || (echo "ERROR: DEPLOY_SHA.txt missing" && exit 1)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
