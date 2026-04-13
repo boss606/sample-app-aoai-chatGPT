@@ -81,12 +81,12 @@ if os.path.isdir(static_dir):
 elif os.path.isdir("/home/site/wwwroot/static"):
     app.mount("/static", StaticFiles(directory="/home/site/wwwroot/static"), name="static")
 
-# Templates - find the correct directory
-templates_dir = "templates"
-if os.path.isdir("/home/site/wwwroot/templates"):
+# Templates - prefer __file__ relative path so app uses templates from the
+# actual deployed location (e.g. /tmp/zipdeploy/extracted/ on Oryx) instead
+# of stale files in /home/site/wwwroot/templates/.
+templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+if not os.path.isdir(templates_dir) and os.path.isdir("/home/site/wwwroot/templates"):
     templates_dir = "/home/site/wwwroot/templates"
-elif os.path.isdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")):
-    templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 templates = Jinja2Templates(directory=templates_dir)
 
 # ============== Multi-Jurisdiction Registry ==============
