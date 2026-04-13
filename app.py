@@ -2098,10 +2098,34 @@ async def get_user_info_api(request: Request):
     """Get user info for display."""
     user_info = get_user_info(request)
     if user_info:
+        claims = user_info.get("claims") or []
+        claim_map = {}
+        for c in claims:
+            typ = c.get("typ") or c.get("type")
+            val = c.get("val") or c.get("value")
+            if typ and val and typ not in claim_map:
+                claim_map[typ] = val
+
+        name = (
+            user_info.get("name")
+            or claim_map.get("name")
+            or claim_map.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
+            or claim_map.get("given_name")
+            or user_info.get("userDetails")
+            or "User"
+        )
+        email = (
+            user_info.get("email")
+            or claim_map.get("preferred_username")
+            or claim_map.get("emails")
+            or claim_map.get("email")
+            or claim_map.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
+            or ""
+        )
         return JSONResponse({
-            "name": user_info.get("name", "User"),
-            "email": user_info.get("email", ""),
-            "authenticated": True
+            "name": name,
+            "email": email,
+            "authenticated": True,
         })
     return JSONResponse({
         "name": "Guest",
