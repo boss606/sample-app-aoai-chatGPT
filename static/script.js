@@ -22,6 +22,11 @@ var attachmentUploadInProgress = false;
 // Conversation history for backend continuity (reuse context across turns)
 var messageHistory = [];
 var searchSource = 'email';
+
+// --- HISTORY STATE ---
+var currentConversationId = null;  // null = conversa nova, ainda não persistida
+var historyEnabled = true;         // lido do backend ao carregar a página
+var sidebarConversations = [];     // cache local para sidebar instantânea
 var selectedM365Items = [];
 var boxConnected = false;
 var boxAuthWindow = null;
@@ -31,189 +36,14 @@ var boxCurrentFolder = '0';
 // ============================================================
 // CHAT HISTORY (CosmosDB via API)
 // ============================================================
-var currentConversationId = null;
-var _historyEnabled = true; // local cache, synced from server on load
-
-function _titleFromMessage(text) {
-    var t = text.replace(/\s+/g, ' ').trim();
-    return t.length > 50 ? t.slice(0, 50) + '\u2026' : t;
-}
-
-function _timeAgo(isoString) {
-    var ts = new Date(isoString).getTime();
-    var diff = Date.now() - ts;
-    var m = Math.floor(diff / 60000);
-    if (m < 1) return 'Just now';
-    if (m < 60) return m + ' min ago';
-    var h = Math.floor(m / 60);
-    if (h < 24) return h === 1 ? '1 hour ago' : h + ' hours ago';
-    var d = Math.floor(h / 24);
-    if (d === 1) return 'Yesterday';
-    if (d < 7) return d + ' days ago';
-    return new Date(ts).toLocaleDateString();
-}
-
-async function openSettings() {
+function openSettings() {
     var modal = document.getElementById('settings-modal');
     if (modal) modal.classList.remove('hidden');
-    try {
-        var resp = await fetch('/api/history/settings');
-        var data = await resp.json();
-        _historyEnabled = data.enabled !== false;
-        var toggle = document.getElementById('history-toggle');
-        if (toggle) toggle.checked = _historyEnabled;
-    } catch(e) {}
 }
 
 function closeSettings() {
     var modal = document.getElementById('settings-modal');
     if (modal) modal.classList.add('hidden');
-}
-
-async function onHistoryToggle(enabled) {
-    _historyEnabled = enabled;
-    try {
-        await fetch('/api/history/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: enabled })
-        });
-    } catch(e) {}
-    renderSidebar();
-}
-
-async function clearAllHistory() {
-    if (!confirm('Clear all saved conversations? This cannot be undone.')) return;
-    try {
-        await fetch('/api/history', { method: 'DELETE' });
-        currentConversationId = null;
-        await renderSidebar();
-    } catch(e) {}
-    closeSettings();
-}
-
-async function saveCurrentConversation() {
-    if (!_historyEnabled) { console.log('[history] disabled, skipping save'); return; }
-    if (messageHistory.length === 0) { console.log('[history] no messages, skipping save'); return; }
-
-    var firstUserMsg = messageHistory.find(function(m) { return m.role === 'user'; });
-    var title = firstUserMsg ? _titleFromMessage(firstUserMsg.content) : 'New conversation';
-
-    try {
-        var body = {
-            title: title,
-            messages: messageHistory,
-        };
-        if (currentConversationId) body.conversation_id = currentConversationId;
-
-        console.log('[history] saving conversation, messages:', messageHistory.length, 'conv_id:', currentConversationId);
-        var resp = await fetch('/api/history', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        var data = await resp.json();
-        console.log('[history] save response:', data);
-        if (data.conversation_id) {
-            currentConversationId = data.conversation_id;
-        }
-        renderSidebar();
-    } catch(e) {
-        console.error('[history] Failed to save conversation:', e);
-    }
-}
-
-async function loadConversation(convId) {
-    try {
-        var resp = await fetch('/api/history/' + convId);
-        var data = await resp.json();
-        if (data.error) return;
-
-        var messages = data.messages || [];
-
-        // Clear chat UI
-        var container = document.getElementById('chat-container');
-        if (container) {
-            container.innerHTML = '';
-            var ws = document.getElementById('welcome-screen');
-            if (!ws) {
-                ws = document.createElement('div');
-                ws.id = 'welcome-screen';
-            }
-            ws.style.display = 'none';
-            container.appendChild(ws);
-        }
-
-        messageHistory = [];
-        clearAllAttachments();
-
-        messages.forEach(function(msg) {
-            messageHistory.push({ role: msg.role, content: msg.content });
-            if (msg.role === 'user') {
-                addMessage(msg.content, 'user');
-            } else if (msg.role === 'assistant') {
-                addMessage(msg.content, 'system', true);
-            }
-        });
-
-        currentConversationId = convId;
-        renderSidebar();
-    } catch(e) {
-        console.warn('Failed to load conversation:', e);
-    }
-}
-
-async function deleteConversation(convId, event) {
-    if (event) event.stopPropagation();
-    try {
-        await fetch('/api/history/' + convId, { method: 'DELETE' });
-        if (currentConversationId === convId) {
-            newConversation();
-        } else {
-            renderSidebar();
-        }
-    } catch(e) {
-        console.warn('Failed to delete conversation:', e);
-    }
-}
-
-async function renderSidebar() {
-    var container = document.getElementById('sb-conversations');
-    if (!container) return;
-
-    if (!_historyEnabled) {
-        container.innerHTML = '<div class="sb-empty">Chat history is disabled.<br>Enable it in Settings.</div>';
-        return;
-    }
-
-    try {
-        var resp = await fetch('/api/history');
-        var data = await resp.json();
-        var conversations = data.conversations || [];
-
-        if (conversations.length === 0) {
-            container.innerHTML = '<div class="sb-empty">No conversations yet.<br>Start chatting to save history.</div>';
-            return;
-        }
-
-        var html = '';
-        conversations.forEach(function(conv) {
-            var isActive = conv.id === currentConversationId;
-            var updatedAt = conv.updatedAt || conv.createdAt || '';
-            html += '<div class="sb-conv-item' + (isActive ? ' active' : '') + '" onclick="loadConversation(\'' + conv.id + '\')">'
-                + '<div class="sb-conv-content">'
-                + '<div class="sb-conv-title">' + escapeHtml(conv.title || 'Untitled') + '</div>'
-                + '<div class="sb-conv-time">' + _timeAgo(updatedAt) + '</div>'
-                + '</div>'
-                + '<button class="sb-conv-delete" onclick="deleteConversation(\'' + conv.id + '\', event)" title="Delete">'
-                + '<i class="fas fa-times"></i>'
-                + '</button>'
-                + '</div>';
-        });
-        container.innerHTML = html;
-    } catch(e) {
-        container.innerHTML = '<div class="sb-empty">Could not load history.</div>';
-    }
 }
 
 // ============================================================
@@ -326,14 +156,8 @@ document.addEventListener('DOMContentLoaded', function() {
     checkAgreement();
     checkBoxStatus();
     loadUserInfo();
+    initHistory();
     updateSendButtonState();
-    // Load history settings then render sidebar
-    fetch('/api/history/settings').then(function(r) { return r.json(); }).then(function(d) {
-        _historyEnabled = d.enabled !== false;
-        var toggle = document.getElementById('history-toggle');
-        if (toggle) toggle.checked = _historyEnabled;
-        renderSidebar();
-    }).catch(function() { renderSidebar(); });
     // Allow ZIP selection in the file picker (handled entirely in JS — no HTML change needed)
     var fileInput = document.getElementById('file-input');
     if (fileInput) {
@@ -1637,12 +1461,9 @@ function startNewConversation() {
 }
 
 async function newConversation() {
-    // Render sidebar FIRST (before resetting state) so current conv stays visible
-    await renderSidebar();
-
     startNewConversation();
 
-    // Clear chat UI
+    // Clear chat UI and show welcome screen
     var container = document.getElementById('chat-container');
     if (container) {
         container.innerHTML = '';
@@ -1660,11 +1481,223 @@ async function newConversation() {
             + '</div>';
         container.appendChild(welcome);
     }
+    // Recarregar sidebar para garantir que conversas recentes aparecem sem active
+    if (historyEnabled) {
+        await loadSidebar();
+    } else {
+        // Só remove o destaque sem recarregar
+        document.querySelectorAll('.sb-conv-item').forEach(function(el) {
+            el.classList.remove('active');
+        });
+    }
+}
+
+// --- HISTORY FUNCTIONS ---
+
+async function initHistory() {
+    console.log('[History] initHistory started');
+    try {
+        var prefResp = await fetch('/api/history/preference');
+        var pref = await prefResp.json();
+        console.log('[History] preference response:', pref);
+        historyEnabled = pref.history_enabled !== false;
+        console.log('[History] historyEnabled set to:', historyEnabled);
+        var toggle = document.getElementById('history-toggle');
+        if (toggle) toggle.checked = historyEnabled;
+        if (historyEnabled) {
+            await loadSidebar();
+        }
+    } catch (e) {
+        console.warn('[History] initHistory failed:', e);
+    }
+}
+
+async function loadSidebar() {
+    try {
+        var resp = await fetch('/api/history/conversations');
+        var data = await resp.json();
+        sidebarConversations = data.conversations || [];
+        renderSidebar();
+    } catch (e) {
+        console.warn('Failed to load sidebar:', e);
+    }
+}
+
+// Re-renderiza os timestamps relativos a cada 60s sem buscar do servidor
+setInterval(function() {
+    if (sidebarConversations.length > 0) renderSidebar();
+}, 60000);
+
+function renderSidebar() {
+    var container = document.getElementById('sb-conversations');
+    console.log('[History] renderSidebar: container=', !!container, '| count=', sidebarConversations.length);
+    if (!container) return;
+
+    if (sidebarConversations.length === 0) {
+        container.innerHTML = '<div class="sb-empty">No conversations yet...</div>';
+        return;
+    }
+
+    container.innerHTML = sidebarConversations.map(function(conv) {
+        var isActive = conv.id === currentConversationId ? ' active' : '';
+        var title = _escHtml(conv.title || 'Untitled conversation');
+        var time = _relativeTime(conv.updatedAt || conv.createdAt);
+        return '<div class="sb-conv-item' + isActive + '" data-id="' + conv.id + '" onclick="loadConversation(\'' + conv.id + '\')">'
+            + '<div class="sb-conv-content">'
+            + '<div class="sb-conv-title">' + title + '</div>'
+            + '<div class="sb-conv-time">' + time + '</div>'
+            + '</div>'
+            + '<button class="sb-conv-delete" onclick="deleteConversation(event,\'' + conv.id + '\')">×</button>'
+            + '</div>';
+    }).join('');
+}
+
+function _escHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function _relativeTime(isoStr) {
+    if (!isoStr) return '';
+    // CosmosDB armazena UTC sem 'Z' — forçar parse como UTC
+    var utc = isoStr.endsWith('Z') || isoStr.includes('+') ? isoStr : isoStr + 'Z';
+    var diff = Date.now() - new Date(utc).getTime();
+    var mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'Just now';
+    if (mins < 60) return mins + 'm ago';
+    var hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    return Math.floor(hours / 24) + 'd ago';
+}
+
+async function loadConversation(conversationId) {
+    currentConversationId = conversationId;
+    messageHistory = [];
+
+    var container = document.getElementById('chat-container');
+    if (container) container.innerHTML = '<div style="padding:1rem;opacity:.5">Loading...</div>';
+
+    try {
+        var resp = await fetch('/api/history/conversations/' + conversationId + '/messages');
+        var data = await resp.json();
+        var messages = data.messages || [];
+
+        if (container) container.innerHTML = '';
+        messages.forEach(function(msg) {
+            addMessage(msg.content, msg.role === 'user' ? 'user' : 'system', true);
+            messageHistory.push({ role: msg.role, content: msg.content });
+        });
+
+        document.querySelectorAll('.sb-conv-item').forEach(function(el) {
+            el.classList.toggle('active', el.dataset.id === conversationId);
+        });
+    } catch (e) {
+        console.error('Failed to load conversation:', e);
+        if (container) container.innerHTML = '';
+        addMessage('Failed to load conversation.', 'system-error');
+    }
+}
+
+async function deleteConversation(event, conversationId) {
+    event.stopPropagation();
+    try {
+        await fetch('/api/history/conversations/' + conversationId, { method: 'DELETE' });
+        sidebarConversations = sidebarConversations.filter(function(c) { return c.id !== conversationId; });
+        renderSidebar();
+        if (currentConversationId === conversationId) {
+            currentConversationId = null;
+            newConversation();
+        }
+    } catch (e) {
+        console.error('Failed to delete conversation:', e);
+    }
+}
+
+async function clearAllHistory() {
+    if (!confirm('Delete all conversations? This cannot be undone.')) return;
+    try {
+        await fetch('/api/history/conversations', { method: 'DELETE' });
+        sidebarConversations = [];
+        currentConversationId = null;
+        renderSidebar();
+        newConversation();
+    } catch (e) {
+        console.error('Failed to clear history:', e);
+    }
+}
+
+async function onHistoryToggle(checked) {
+    historyEnabled = checked;
+    try {
+        await fetch('/api/history/preference', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ history_enabled: checked })
+        });
+        if (!checked) {
+            sidebarConversations = [];
+            currentConversationId = null;
+            renderSidebar();
+        } else {
+            await loadSidebar();
+        }
+    } catch (e) {
+        console.error('Failed to save history preference:', e);
+    }
+}
+
+async function _persistHistory(userMessage, assistantMessage) {
+    console.log('[History] _persistHistory called, currentConversationId=', currentConversationId);
+    if (!currentConversationId) {
+        // Primeira interação: cria conversa + salva par no banco e atualiza sidebar
+        try {
+            console.log('[History] Creating new conversation...');
+            var resp = await fetch('/api/history/conversations', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title: userMessage.slice(0, 80),
+                    user_message: userMessage,
+                    assistant_message: assistantMessage
+                })
+            });
+            var data = await resp.json();
+            console.log('[History] Create response:', resp.status, data);
+            if (data.conversation_id) {
+                currentConversationId = data.conversation_id;
+                console.log('[History] Conversation created, loading sidebar...');
+                await loadSidebar();
+                console.log('[History] Sidebar loaded, conversations:', sidebarConversations.length);
+            } else {
+                console.warn('[History] No conversation_id in response:', data);
+            }
+        } catch (e) {
+            console.error('[History] Failed to create conversation:', e);
+        }
+    } else {
+        // Turnos subsequentes: só salva no banco, sidebar não muda
+        try {
+            var prevUserMsg = messageHistory[messageHistory.length - 2];
+            var r = await fetch('/api/history/conversations/' + currentConversationId + '/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_message: prevUserMsg ? prevUserMsg.content : userMessage,
+                    assistant_message: assistantMessage
+                })
+            });
+            console.log('[History] Messages saved, status:', r.status);
+        } catch (e) {
+            console.error('[History] Failed to save messages:', e);
+        }
+    }
 }
 
 // --- CHAT FUNCTIONS ---
 
 async function sendMessage() {
+    console.log('[History] sendMessage called');
     var input = document.getElementById('user-input');
     if (!input) return;
 
@@ -1753,8 +1786,10 @@ async function sendMessage() {
                         if (streamingBubble) {
                             updateStreamingBubble(streamingBubble, fullText, true);
                         }
+                        ws.close();  // servidor nunca fecha — cliente fecha ao receber 'done'
                     } else if (ev.type === 'error') {
                         wsError = ev.message || 'unknown';
+                        ws.close();
                     }
                     // 'ping' messages are keep-alives, ignored
                 } catch (e) { /* ignore parse errors */ }
@@ -1763,6 +1798,8 @@ async function sendMessage() {
             ws.onclose = function() { resolve(); };
             ws.onerror = function() { reject(new Error('WebSocket connection failed')); };
         });
+
+        console.log('[History] WS closed: wsError=', wsError, '| fullText len=', fullText.length, '| receivedDone=', receivedDone);
 
         if (wsError) {
             removeMessage(statusId);
@@ -1779,10 +1816,16 @@ async function sendMessage() {
         }
         if (fullText) {
             messageHistory.push({ role: 'assistant', content: fullText });
-            await saveCurrentConversation();
+
+            // Persistir no histórico (apenas se habilitado e sem erro)
+            console.log('[History] check: historyEnabled=', historyEnabled, '| fullText len=', fullText.length, '| currentConversationId=', currentConversationId);
+            if (historyEnabled) {
+                _persistHistory(userContent, fullText);
+            }
         }
 
     } catch (error) {
+        console.error('[History] sendMessage catch:', error.message);
         removeMessage(statusId);
         addMessage('Failed to connect to server: ' + error.message, 'system-error');
         messageHistory.pop();
