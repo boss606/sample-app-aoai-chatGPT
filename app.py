@@ -2106,11 +2106,16 @@ async def get_user_info_api(request: Request):
             if typ and val and typ not in claim_map:
                 claim_map[typ] = val
 
+        given = claim_map.get("given_name") or ""
+        family = claim_map.get("family_name") or claim_map.get("surname") or ""
+        full_from_parts = f"{given} {family}".strip() if (given or family) else ""
+
         name = (
             user_info.get("name")
             or claim_map.get("name")
             or claim_map.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
-            or claim_map.get("given_name")
+            or full_from_parts
+            or given
             or user_info.get("userDetails")
             or "User"
         )
