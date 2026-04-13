@@ -102,6 +102,52 @@ jobs:
           slot-name: 'Production'
           package: release.zip
 
+      - name: Force-sync templates and static files via Kudu VFS
+        run: |
+          # Workaround: webapps-deploy@v3 não sobrescreve templates/ em alguns casos.
+          # Push direto via Kudu VFS API garante substituição.
+          mkdir -p /tmp/extract && unzip -o release.zip -d /tmp/extract > /dev/null
+
+          CREDS=$(az webapp deployment list-publishing-credentials \
+            --name Joogni-West --resource-group GLG-AI \
+            --query "{u:publishingUserName, p:publishingPassword}" -o json)
+          USER=$(echo "$CREDS" | jq -r '.u')
+          PASS=$(echo "$CREDS" | jq -r '.p')
+          SCM="https://joogni-west.scm.azurewebsites.net"
+
+          upload_file() {
+            local src="$1"
+            local dest="$2"
+            local code=$(curl -s -o /tmp/resp -w "%{http_code}" -X PUT \
+              -u "$USER:$PASS" \
+              -H "If-Match: *" \
+              --data-binary @"$src" \
+              "$SCM/api/vfs/site/wwwroot/$dest")
+            if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
+              echo "  OK ($code) $dest"
+            else
+              echo "  FAIL ($code) $dest"
+              cat /tmp/resp
+              return 1
+            fi
+          }
+
+          echo "=== Syncing templates/ ==="
+          for f in /tmp/extract/templates/*.html; do
+            name=$(basename "$f")
+            upload_file "$f" "templates/$name"
+          done
+
+          echo "=== Syncing static/ root files ==="
+          for f in /tmp/extract/static/*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            upload_file "$f" "static/$name"
+          done
+
+          echo "=== Syncing DEPLOY_SHA.txt ==="
+          upload_file "/tmp/extract/DEPLOY_SHA.txt" "DEPLOY_SHA.txt"
+
       - name: Restart App Service to reload Jinja2 templates
         run: az webapp restart --name Joogni-West --resource-group GLG-AI
 
