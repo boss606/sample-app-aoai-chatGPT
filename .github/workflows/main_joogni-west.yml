@@ -74,3 +74,6 @@ jobs:
           app-name: 'Joogni-West'
           slot-name: 'Production'
           package: .
+
+      - name: Restart App Service to reload Jinja2 templates
+        run: az webapp restart --name Joogni-West --resource-group GLG-AI
