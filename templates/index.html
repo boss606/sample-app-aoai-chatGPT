@@ -73,13 +73,70 @@
             flex-direction: column;
             overflow: hidden;
             position: relative;
+            transition: width 0.25s ease, min-width 0.25s ease;
         }
+
+        .sidebar.collapsed { width: 64px; min-width: 64px; }
+        .sidebar.collapsed .sb-logo { padding: 20px 12px 16px; justify-content: center; position: relative; cursor: pointer; }
+        .sidebar.collapsed .sb-logo-txt,
+        .sidebar.collapsed .sb-section-label,
+        .sidebar.collapsed .sb-conversations,
+        .sidebar.collapsed .sb-settings-btn span,
+        .sidebar.collapsed .sb-user-name { display: none; }
+        .sidebar.collapsed .sb-new-btn { display: none; }
+        .sidebar.collapsed .sb-settings-btn { justify-content: center; padding: 10px 0; }
+        .sidebar.collapsed .sb-user { justify-content: center; padding: 8px 0; }
+
+        /* Expanded state: collapse button inside the sidebar, top-right */
+        .sb-collapse-btn {
+            position: absolute;
+            top: 22px;
+            right: 12px;
+            width: 26px;
+            height: 26px;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: rgba(255,255,255,0.7);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            z-index: 5;
+            transition: background 0.15s, color 0.15s, opacity 0.2s;
+        }
+        .sb-collapse-btn:hover { background: rgba(255,255,255,0.14); color: white; }
+
+        /* Collapsed state: button overlays the logo mark; visible only on logo hover */
+        .sidebar.collapsed .sb-collapse-btn {
+            top: 20px;
+            left: 12px;
+            right: auto;
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--primary-500) 0%, var(--primary-400) 100%);
+            border: none;
+            color: white;
+            font-size: 14px;
+            opacity: 0;
+            pointer-events: none;
+            box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+        }
+        .sidebar.collapsed .sb-logo:hover .sb-collapse-btn {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .sidebar.collapsed .sb-logo:hover .sb-logo-mark { opacity: 0; }
+        .sb-logo-mark { transition: opacity 0.15s; }
 
         .sb-logo {
             display: flex;
             align-items: center;
             gap: 12px;
             padding: 20px 16px 16px;
+            position: relative;
         }
 
         .sb-logo-mark {
@@ -1269,15 +1326,18 @@
         <aside class="sidebar" id="sidebar">
             <div class="sb-logo">
                 <div class="sb-logo-mark">J</div>
-                <div>
+                <div class="sb-logo-txt">
                     <div class="sb-logo-text">Joogni</div>
                     <div class="sb-logo-sub">Legal AI</div>
                 </div>
+                <button class="sb-collapse-btn" id="sb-collapse-btn" onclick="toggleSidebar()" title="Collapse sidebar" aria-label="Toggle sidebar">
+                    <i class="fas fa-chevron-left" id="sb-collapse-icon"></i>
+                </button>
             </div>
 
-            <button class="sb-new-btn" onclick="newConversation()">
+            <button class="sb-new-btn" onclick="newConversation()" title="New conversation">
                 <i class="fas fa-plus"></i>
-                New conversation
+                <span>New conversation</span>
             </button>
 
             <div class="sb-section-label">Recent</div>
@@ -1286,9 +1346,9 @@
             </div>
 
             <div class="sb-bottom">
-                <button class="sb-settings-btn" onclick="openSettings()">
+                <button class="sb-settings-btn" onclick="openSettings()" title="Settings">
                     <i class="fas fa-gear"></i>
-                    Settings
+                    <span>Settings</span>
                 </button>
                 <div class="sb-user">
                     <div class="sb-user-avatar" id="sb-user-initials">?</div>

@@ -46,6 +46,39 @@ function closeSettings() {
     if (modal) modal.classList.add('hidden');
 }
 
+function applySidebarState(collapsed) {
+    var sidebar = document.getElementById('sidebar');
+    if (!sidebar) return;
+    sidebar.classList.toggle('collapsed', !!collapsed);
+    var btn = document.getElementById('sb-collapse-btn');
+    if (btn) btn.setAttribute('title', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+    var icon = document.getElementById('sb-collapse-icon');
+    if (icon) {
+        icon.classList.toggle('fa-chevron-left', !collapsed);
+        icon.classList.toggle('fa-chevron-right', !!collapsed);
+    }
+}
+
+function toggleSidebar() {
+    var sidebar = document.getElementById('sidebar');
+    if (!sidebar) return;
+    var willCollapse = !sidebar.classList.contains('collapsed');
+    applySidebarState(willCollapse);
+    try { localStorage.setItem('joogni.sidebarCollapsed', willCollapse ? '1' : '0'); } catch (e) {}
+}
+
+(function restoreSidebarState() {
+    try {
+        if (localStorage.getItem('joogni.sidebarCollapsed') !== '1') return;
+        var apply = function () { applySidebarState(true); };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', apply);
+        } else {
+            apply();
+        }
+    } catch (e) {}
+})();
+
 // ============================================================
 
 console.log('Joogni script loaded');
