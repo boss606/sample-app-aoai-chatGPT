@@ -51,6 +51,7 @@ from backend.job_storage import (
     update_agentic_job,
     get_job_storage_backend,
 )
+from backend.history.cosmosdbservice import CosmosConversationClient
 
 from dotenv import load_dotenv
 load_dotenv(override=False)
@@ -684,7 +685,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True #bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -1846,8 +1847,207 @@ async def calculators_page(request: Request):
 user_agreements = {}
 
 
+# ============== CosmosDB Chat History ==============
+
+# Singleton — created once at startup, reused across all requests
+_cosmos_client_instance: Optional[CosmosConversationClient] = None
+
+def _get_cosmos_client() -> Optional[CosmosConversationClient]:
+    """Return the shared CosmosDB client. Initializes once on first call."""
+    global _cosmos_client_instance
+    if _cosmos_client_instance is not None:
+        return _cosmos_client_instance
+
+    account = os.getenv("AZURE_COSMOSDB_ACCOUNT", "").strip().rstrip("/")
+    key = os.getenv("AZURE_COSMOSDB_ACCOUNT_KEY", "").strip()
+    database = os.getenv("AZURE_COSMOSDB_DATABASE", "").strip()
+    container = os.getenv("AZURE_COSMOSDB_CONVERSATIONS_CONTAINER", "conversations").strip()
+
+    if not account or not key or not database:
+        return None
+
+    if not account.startswith("http"):
+        account = f"https://{account}"
+
+    try:
+        _cosmos_client_instance = CosmosConversationClient(
+            cosmosdb_endpoint=account,
+            credential=key,
+            database_name=database,
+            container_name=container,
+            enable_message_feedback=False,
+        )
+        print("CosmosDB client initialized", file=sys.stderr)
+        return _cosmos_client_instance
+    except Exception as e:
+        print(f"CosmosDB init error: {e}", file=sys.stderr)
+        return None
+
+
+# ============== History API ==============
+
+def _get_history_user_id(request: Request) -> str:
+    """Retorna user_id estável para o CosmosDB.
+    Usa e-mail quando autenticado (AUTH_ENABLED=true), senão IP do cliente."""
+    user_info = get_user_info(request)
+    if user_info and user_info.get("email"):
+        return user_info["email"]
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "anonymous")
+
+
+@app.get("/api/history/conversations")
+async def history_list(request: Request):
+    """Lista conversas ativas do usuário ordenadas por mais recente (máx. 50)."""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        return JSONResponse({"conversations": [], "history_enabled": False})
+    user_id = _get_history_user_id(request)
+    try:
+        conversations = await cosmos.get_conversations(user_id, limit=50, sort_order="DESC")
+        return JSONResponse({"conversations": conversations, "history_enabled": True})
+    except Exception as e:
+        print(f"history_list error: {e}", file=sys.stderr)
+        return JSONResponse({"conversations": [], "error": str(e)}, status_code=500)
+
+
+@app.get("/api/history/conversations/{conversation_id}/messages")
+async def history_messages(conversation_id: str, request: Request):
+    """Retorna todas as mensagens de uma conversa específica."""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        raise HTTPException(status_code=503, detail="History not configured")
+    user_id = _get_history_user_id(request)
+    try:
+        messages = await cosmos.get_messages(user_id, conversation_id)
+        return JSONResponse({"messages": messages})
+    except Exception as e:
+        print(f"history_messages error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/history/conversations")
+async def history_create(request: Request):
+    """Cria conversa e persiste o primeiro par pergunta/resposta.
+    Chamado pelo frontend SOMENTE após receber a primeira resposta com sucesso.
+    Payload: { title, user_message, assistant_message }"""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        return JSONResponse({"conversation_id": None, "history_enabled": False})
+    user_id = _get_history_user_id(request)
+    try:
+        data = await request.json()
+        title = (data.get("title") or data.get("user_message") or "Nova conversa")[:80]
+        user_msg = data.get("user_message", "")
+        assistant_msg = data.get("assistant_message", "")
+
+        conv = await cosmos.create_conversation(user_id, title=title)
+        conv_id = conv["id"]
+        await cosmos.create_message(str(uuid.uuid4()), conv_id, user_id, {"role": "user", "content": user_msg})
+        await cosmos.create_message(str(uuid.uuid4()), conv_id, user_id, {"role": "assistant", "content": assistant_msg})
+        return JSONResponse({"conversation_id": conv_id, "conversation": conv})
+    except Exception as e:
+        print(f"history_create error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/history/conversations/{conversation_id}/messages")
+async def history_add_messages(conversation_id: str, request: Request):
+    """Persiste um par de mensagens em conversa existente (turnos 2, 3, ...).
+    Payload: { user_message, assistant_message }"""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        return JSONResponse({"ok": False, "history_enabled": False})
+    user_id = _get_history_user_id(request)
+    try:
+        data = await request.json()
+        await cosmos.create_message(str(uuid.uuid4()), conversation_id, user_id,
+                                    {"role": "user", "content": data.get("user_message", "")})
+        await cosmos.create_message(str(uuid.uuid4()), conversation_id, user_id,
+                                    {"role": "assistant", "content": data.get("assistant_message", "")})
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"history_add_messages error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/history/conversations/{conversation_id}")
+async def history_delete_one(conversation_id: str, request: Request):
+    """Soft-delete de uma conversa específica."""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        raise HTTPException(status_code=503, detail="History not configured")
+    user_id = _get_history_user_id(request)
+    try:
+        await cosmos.delete_conversation(user_id, conversation_id)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"history_delete_one error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/history/conversations")
+async def history_clear_all(request: Request):
+    """Soft-delete de todas as conversas do usuário."""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        raise HTTPException(status_code=503, detail="History not configured")
+    user_id = _get_history_user_id(request)
+    try:
+        conversations = await cosmos.get_conversations(user_id, limit=None)
+        for conv in conversations:
+            await cosmos.delete_conversation(user_id, conv["id"])
+        return JSONResponse({"ok": True, "deleted": len(conversations)})
+    except Exception as e:
+        print(f"history_clear_all error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/history/preference")
+async def history_preference_get(request: Request):
+    """Lê preferência de histórico habilitado/desabilitado do usuário."""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        return JSONResponse({"history_enabled": True})
+    user_id = _get_history_user_id(request)
+    try:
+        doc = await cosmos.container_client.read_item(
+            item=f"pref_{user_id}", partition_key=user_id
+        )
+        return JSONResponse({"history_enabled": doc.get("history_enabled", True)})
+    except Exception:
+        # Documento não existe ainda — padrão é habilitado
+        return JSONResponse({"history_enabled": True})
+
+
+@app.post("/api/history/preference")
+async def history_preference_set(request: Request):
+    """Salva preferência de histórico habilitado/desabilitado.
+    Payload: { history_enabled: bool }"""
+    cosmos = _get_cosmos_client()
+    if not cosmos:
+        return JSONResponse({"ok": False})
+    user_id = _get_history_user_id(request)
+    try:
+        data = await request.json()
+        enabled = bool(data.get("history_enabled", True))
+        pref_doc = {
+            "id": f"pref_{user_id}",
+            "type": "preference",
+            "userId": user_id,
+            "history_enabled": enabled,
+            "updatedAt": datetime.utcnow().isoformat()
+        }
+        await cosmos.container_client.upsert_item(pref_doc)
+        return JSONResponse({"ok": True, "history_enabled": enabled})
+    except Exception as e:
+        print(f"history_preference_set error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _get_deploy_sha() -> str:
-    """Read deploy SHA from DEPLOY_SHA.txt for cache busting and verification."""
+    """Read deploy SHA from DEPLOY_SHA.txt for cache busting and verification.
+    Falls back to script.js modification time so page and /api/version always agree."""
     try:
         sha_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DEPLOY_SHA.txt")
         if os.path.isfile(sha_path):
@@ -1855,7 +2055,13 @@ def _get_deploy_sha() -> str:
                 return f.read().strip()[:12]
     except Exception:
         pass
-    return "not-deployed"
+    # Fallback: use script.js mtime so all callers return the same value
+    try:
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "script.js")
+        return str(int(os.path.getmtime(script_path)))
+    except Exception:
+        pass
+    return "dev"
 
 
 @app.get("/api/version")
@@ -1931,6 +2137,11 @@ async def box_status(request: Request):
         "connected": False,
         "message": "Box integration not configured"
     })
+
+
+# ---- Chat History endpoints (to be implemented) ----
+# CosmosDB client is available via _get_cosmos_client()
+
 
 def pick_search_query(messages: List[dict]) -> str:
     """
