@@ -1,0 +1,79 @@
+name: Build and deploy Python app to Azure Web App - Joogni-West
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create virtual environment and install dependencies
+        run: |
+          python -m venv antenv
+          source antenv/bin/activate
+          pip install -r requirements.txt
+
+      - name: Create deploy marker (app reads this at runtime for script cache busting)
+        run: |
+          echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
+
+      - name: Upload artifact for deployment jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-app
+          path: |
+            .
+            !antenv/
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: python-app
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Enable Oryx build and WebSockets
+        run: |
+          az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
+                       POST_BUILD_COMMAND="pip install websockets==14.2" \
+            --output none
+          az webapp config appsettings delete --name Joogni-West --resource-group GLG-AI \
+            --setting-names POST_BUILD_SCRIPT_PATH --output none 2>/dev/null || true
+          az webapp config set --name Joogni-West --resource-group GLG-AI \
+            --web-sockets-enabled true --output none
+
+      - name: Wait for SCM after config change
+        run: sleep 90
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'Joogni-West'
+          slot-name: 'Production'
+          package: .
+
+      - name: Restart App Service to reload Jinja2 templates
+        run: az webapp restart --name Joogni-West --resource-group GLG-AI

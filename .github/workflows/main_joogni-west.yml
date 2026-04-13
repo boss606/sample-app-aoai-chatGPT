@@ -19,23 +19,49 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Create virtual environment and install dependencies
+      - name: Install dependencies
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
 
-      - name: Create deploy marker (app reads this at runtime for script cache busting)
-        run: |
-          echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
+      - name: Create deploy marker
+        run: echo -n "${{ github.sha }}" > DEPLOY_SHA.txt
 
-      - name: Upload artifact for deployment jobs
+      - name: Create deployment zip
+        run: |
+          zip -r release.zip . \
+            -x "myenv/*" \
+               "antenv/*" \
+               ".git/*" \
+               ".github/*" \
+               "__pycache__/*" \
+               "*/__pycache__/*" \
+               "*.pyc" \
+               "node_modules/*" \
+               "frontend/node_modules/*" \
+               ".venv/*" \
+               "venv/*" \
+               "tests/*" \
+               ".pytest_cache/*"
+
+      - name: Verify critical files are in zip
+        run: |
+          echo "=== Templates in zip ==="
+          unzip -l release.zip | grep -E "templates/" || (echo "ERROR: no templates in zip" && exit 1)
+          echo "=== Static files in zip ==="
+          unzip -l release.zip | grep -E "static/" || (echo "ERROR: no static in zip" && exit 1)
+          echo "=== App entrypoint in zip ==="
+          unzip -l release.zip | grep -E "(^|/)app\.py" || (echo "ERROR: app.py missing" && exit 1)
+          echo "=== Deploy marker in zip ==="
+          unzip -l release.zip | grep "DEPLOY_SHA.txt" || (echo "ERROR: DEPLOY_SHA.txt missing" && exit 1)
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            .
-            !antenv/
+          path: release.zip
+          retention-days: 7
 
   deploy:
     runs-on: ubuntu-latest
@@ -44,7 +70,7 @@ jobs:
       contents: read
 
     steps:
-      - name: Download artifact from build job
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: python-app
@@ -54,10 +80,11 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Enable Oryx build and WebSockets
+      - name: Configure App Service settings
         run: |
           az webapp config appsettings set --name Joogni-West --resource-group GLG-AI \
-            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
+            --settings SCM_DO_BUILD_DURING_DEPLOYMENT=true \
+                       SCM_ZIPDEPLOY_DONOT_PRESERVE_FILETIME=1 \
                        POST_BUILD_COMMAND="pip install websockets==14.2" \
             --output none
           az webapp config appsettings delete --name Joogni-West --resource-group GLG-AI \
@@ -68,12 +95,26 @@ jobs:
       - name: Wait for SCM after config change
         run: sleep 90
 
-      - name: Deploy to Azure Web App
+      - name: Deploy zip to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'Joogni-West'
           slot-name: 'Production'
-          package: .
+          package: release.zip
 
       - name: Restart App Service to reload Jinja2 templates
         run: az webapp restart --name Joogni-West --resource-group GLG-AI
+
+      - name: Verify deploy via /api/version
+        run: |
+          sleep 20
+          for i in 1 2 3 4 5; do
+            SHA=$(curl -s https://advocateintel.ai/api/version | grep -o '"deploy_sha":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$SHA" = "$(echo ${{ github.sha }} | cut -c1-12)" ]; then
+              echo "Deploy confirmed: $SHA"
+              exit 0
+            fi
+            echo "Attempt $i: server reports '$SHA', expected '$(echo ${{ github.sha }} | cut -c1-12)'. Retrying in 15s..."
+            sleep 15
+          done
+          echo "WARNING: /api/version did not return expected SHA within timeout. Check manually."
