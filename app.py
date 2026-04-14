@@ -2097,6 +2097,35 @@ async def get_user(request: Request):
 async def get_user_info_api(request: Request):
     """Get user info for display."""
     user_info = get_user_info(request)
+
+    # --- DIAGNOSTIC: inspect Easy Auth headers and principal claims ---
+    id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
+    principal_hdr = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    print(
+        f"[user-info] principal_present={bool(principal_hdr)} "
+        f"id_token_present={bool(id_token)} "
+        f"user_info_top_keys={list(user_info.keys()) if user_info else None}",
+        file=sys.stderr,
+    )
+    if user_info:
+        raw_claims = user_info.get("claims") or []
+        print(
+            f"[user-info] claims_raw={json.dumps(raw_claims)[:2000]}",
+            file=sys.stderr,
+        )
+    if id_token:
+        try:
+            payload = id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            jwt_claims = json.loads(base64.urlsafe_b64decode(payload))
+            print(
+                f"[user-info] jwt_claims={json.dumps(jwt_claims)[:2000]}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"[user-info] jwt_decode_error={e}", file=sys.stderr)
+    # --- END DIAGNOSTIC ---
+
     if user_info:
         claims = user_info.get("claims") or []
         claim_map = {}
