@@ -1193,10 +1193,19 @@
             background: var(--gray-50);
             border: 1.5px solid var(--gray-200);
             border-radius: 12px;
-            color: var(--gray-400);
-            cursor: default;
+            color: var(--gray-600);
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s, border-color 0.15s;
         }
+        .btn-mic:hover { background: var(--gray-100); color: var(--primary-600); border-color: var(--primary-300); }
+        .btn-mic:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-mic i { font-size: 18px; }
+        .btn-mic.recording { background: #fee2e2; border-color: #ef4444; color: #ef4444; animation: mic-pulse 1.2s ease-in-out infinite; }
+        .btn-mic.transcribing { background: var(--gray-100); color: var(--primary-600); }
+        @keyframes mic-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+            50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+        }
         
         @media (max-width: 768px) {
             .header { padding: 0 16px; }
@@ -1460,7 +1469,7 @@
                 <i class="fas fa-paperclip"></i>
                 <span id="attachment-count" class="attachment-badge hidden">0</span>
             </button>
-            <button class="btn-mic" title="Voice input (coming soon)" tabindex="-1" disabled style="display:none;">
+            <button id="btn-mic" class="btn-mic" title="Voice input" onclick="toggleMic()">
                 <i class="fas fa-microphone"></i>
             </button>
             <label class="btn-free-chat" title="Free Chat (no RAG, ChatGPT)">

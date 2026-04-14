@@ -2149,4 +2149,139 @@ function formatFileSize(bytes) {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+// --- VOICE INPUT (Whisper) ---
+
+var micState = { recorder: null, stream: null, chunks: [], mime: '', recording: false, busy: false };
+
+function _micPickMime() {
+    var candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4'
+    ];
+    if (typeof MediaRecorder === 'undefined') return '';
+    for (var i = 0; i < candidates.length; i++) {
+        if (MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+    }
+    return '';
+}
+
+function _micSetState(cls) {
+    var btn = document.getElementById('btn-mic');
+    if (!btn) return;
+    btn.classList.remove('recording', 'transcribing');
+    if (cls) btn.classList.add(cls);
+    var icon = btn.querySelector('i');
+    if (icon) {
+        icon.className = cls === 'recording' ? 'fas fa-stop'
+                       : cls === 'transcribing' ? 'fas fa-spinner fa-spin'
+                       : 'fas fa-microphone';
+    }
+    btn.disabled = cls === 'transcribing';
+    btn.title = cls === 'recording' ? 'Stop recording'
+              : cls === 'transcribing' ? 'Transcribing…'
+              : 'Voice input';
+}
+
+async function toggleMic() {
+    if (micState.busy) return;
+    if (micState.recording) { _micStop(); return; }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        addMessage('Voice input not supported in this browser.', 'system-error');
+        return;
+    }
+
+    try {
+        var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        var mime = _micPickMime();
+        var recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        micState.recorder = recorder;
+        micState.stream = stream;
+        micState.chunks = [];
+        micState.mime = recorder.mimeType || mime || 'audio/webm';
+        micState.recording = true;
+
+        recorder.ondataavailable = function(e) { if (e.data && e.data.size > 0) micState.chunks.push(e.data); };
+        recorder.onstop = _micOnStop;
+        recorder.start();
+        _micSetState('recording');
+
+        // Safety cap: 2 min max
+        setTimeout(function() { if (micState.recording) _micStop(); }, 120000);
+    } catch (err) {
+        console.error('[mic] getUserMedia failed:', err);
+        var msg = (err && err.name === 'NotAllowedError')
+            ? 'Microphone permission denied.'
+            : 'Could not access microphone: ' + (err && err.message ? err.message : err);
+        addMessage(msg, 'system-error');
+        _micCleanup();
+        _micSetState('');
+    }
+}
+
+function _micStop() {
+    if (!micState.recorder) return;
+    try { micState.recorder.stop(); } catch (e) {}
+    micState.recording = false;
+}
+
+function _micCleanup() {
+    if (micState.stream) {
+        try { micState.stream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    }
+    micState.recorder = null;
+    micState.stream = null;
+    micState.chunks = [];
+    micState.recording = false;
+}
+
+async function _micOnStop() {
+    var chunks = micState.chunks;
+    var mime = micState.mime;
+    _micCleanup();
+
+    if (!chunks.length) { _micSetState(''); return; }
+
+    var blob = new Blob(chunks, { type: mime });
+    if (blob.size < 1024) {
+        addMessage('Recording too short.', 'system-error');
+        _micSetState('');
+        return;
+    }
+
+    _micSetState('transcribing');
+    micState.busy = true;
+    try {
+        var ext = mime.indexOf('mp4') >= 0 ? 'm4a' : mime.indexOf('ogg') >= 0 ? 'ogg' : 'webm';
+        var form = new FormData();
+        form.append('audio', blob, 'recording.' + ext);
+
+        var resp = await fetch('/api/transcribe', { method: 'POST', body: form, credentials: 'same-origin' });
+        if (!resp.ok) {
+            var errText = await resp.text();
+            throw new Error('HTTP ' + resp.status + ': ' + errText);
+        }
+        var data = await resp.json();
+        var text = (data && data.text) ? data.text.trim() : '';
+        if (!text) {
+            addMessage('No speech detected.', 'system-error');
+        } else {
+            var input = document.getElementById('user-input');
+            if (input) {
+                input.value = input.value ? (input.value.trim() + ' ' + text) : text;
+                input.focus();
+                if (typeof updateSendButtonState === 'function') updateSendButtonState();
+            }
+        }
+    } catch (err) {
+        console.error('[mic] transcription failed:', err);
+        addMessage('Transcription failed: ' + (err && err.message ? err.message : err), 'system-error');
+    } finally {
+        micState.busy = false;
+        _micSetState('');
+    }
+}
+
 console.log('Joogni script fully loaded');

@@ -685,7 +685,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return True #bool(principal or id_token)
+    return bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -2097,35 +2097,6 @@ async def get_user(request: Request):
 async def get_user_info_api(request: Request):
     """Get user info for display."""
     user_info = get_user_info(request)
-
-    # --- DIAGNOSTIC: inspect Easy Auth headers and principal claims ---
-    id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    principal_hdr = request.headers.get("X-MS-CLIENT-PRINCIPAL")
-    print(
-        f"[user-info] principal_present={bool(principal_hdr)} "
-        f"id_token_present={bool(id_token)} "
-        f"user_info_top_keys={list(user_info.keys()) if user_info else None}",
-        file=sys.stderr,
-    )
-    if user_info:
-        raw_claims = user_info.get("claims") or []
-        print(
-            f"[user-info] claims_raw={json.dumps(raw_claims)[:2000]}",
-            file=sys.stderr,
-        )
-    if id_token:
-        try:
-            payload = id_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            jwt_claims = json.loads(base64.urlsafe_b64decode(payload))
-            print(
-                f"[user-info] jwt_claims={json.dumps(jwt_claims)[:2000]}",
-                file=sys.stderr,
-            )
-        except Exception as e:
-            print(f"[user-info] jwt_decode_error={e}", file=sys.stderr)
-    # --- END DIAGNOSTIC ---
-
     if user_info:
         claims = user_info.get("claims") or []
         claim_map = {}
@@ -2137,13 +2108,13 @@ async def get_user_info_api(request: Request):
 
         given = claim_map.get("given_name") or ""
         family = claim_map.get("family_name") or claim_map.get("surname") or ""
-        full_from_parts = f"{given} {family}".strip() if (given or family) else ""
+        full_from_parts = f"{given} {family}".strip() if (given and family) else ""
 
         name = (
-            user_info.get("name")
+            full_from_parts
+            or user_info.get("name")
             or claim_map.get("name")
             or claim_map.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
-            or full_from_parts
             or given
             or user_info.get("userDetails")
             or "User"
@@ -3187,6 +3158,63 @@ async def check_status(request_id: str, request: Request):
         "status": status if status != "pending" else "pending",
         "request_id": request_id,
     })
+
+
+_WHISPER_MAX_MB = 25
+_WHISPER_ALLOWED_MIME_PREFIXES = ("audio/", "video/webm", "video/mp4")
+_whisper_client: Optional[AzureOpenAI] = None
+
+
+def _get_whisper_client() -> AzureOpenAI:
+    global _whisper_client
+    if _whisper_client is not None:
+        return _whisper_client
+    key = os.getenv("AZURE_OPENAI_WHISPER_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_WHISPER_ENDPOINT")
+    api_version = os.getenv("AZURE_OPENAI_WHISPER_API_VERSION", "2024-06-01")
+    if not key or not endpoint:
+        raise HTTPException(status_code=500, detail="Whisper not configured")
+    _whisper_client = AzureOpenAI(api_key=key, azure_endpoint=endpoint, api_version=api_version)
+    return _whisper_client
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(request: Request, audio: UploadFile = File(...)):
+    if not is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    deployment = os.getenv("AZURE_OPENAI_WHISPER_DEPLOYMENT")
+    if not deployment:
+        raise HTTPException(status_code=500, detail="Whisper deployment not configured")
+
+    mime = (audio.content_type or "").lower()
+    if mime and not any(mime.startswith(p) for p in _WHISPER_ALLOWED_MIME_PREFIXES):
+        raise HTTPException(status_code=400, detail=f"Unsupported audio type: {mime}")
+
+    data = await audio.read()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > _WHISPER_MAX_MB:
+        raise HTTPException(status_code=400, detail=f"Audio exceeds {_WHISPER_MAX_MB}MB limit")
+    if len(data) < 1024:
+        raise HTTPException(status_code=400, detail="Audio too short or empty")
+
+    filename = audio.filename or "audio.webm"
+
+    try:
+        client = _get_whisper_client()
+        result = client.audio.transcriptions.create(
+            model=deployment,
+            file=(filename, data, mime or "audio/webm"),
+            language="en",
+            response_format="json",
+        )
+        text = getattr(result, "text", "") or ""
+        return JSONResponse({"text": text.strip()})
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[whisper] transcription error: {type(e).__name__}: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
 
 
 @app.post("/api/documents/analyze")
