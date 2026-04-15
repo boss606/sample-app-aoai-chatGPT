@@ -1886,14 +1886,38 @@ def _get_cosmos_client() -> Optional[CosmosConversationClient]:
 
 # ============== History API ==============
 
+def _extract_email_from_principal(user_info: dict) -> str:
+    """Extrai email do principal do Easy Auth (top-level ou dentro de claims)."""
+    if not user_info:
+        return ""
+    email = user_info.get("email")
+    if email:
+        return email
+    claims = user_info.get("claims") or []
+    claim_map = {}
+    for c in claims:
+        typ = c.get("typ") or c.get("type")
+        val = c.get("val") or c.get("value")
+        if typ and val and typ not in claim_map:
+            claim_map[typ] = val
+    return (
+        claim_map.get("preferred_username")
+        or claim_map.get("emails")
+        or claim_map.get("email")
+        or claim_map.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
+        or user_info.get("userDetails")
+        or ""
+    )
+
+
 def _get_history_user_id(request: Request) -> str:
-    """Retorna user_id estável para o CosmosDB.
-    Usa e-mail quando autenticado (AUTH_ENABLED=true), senão IP do cliente."""
+    """Retorna user_id estável (e-mail) para o CosmosDB.
+    Exige autenticação Easy Auth — sem email = 401."""
     user_info = get_user_info(request)
-    if user_info and user_info.get("email"):
-        return user_info["email"]
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "anonymous")
+    email = _extract_email_from_principal(user_info)
+    if not email:
+        raise HTTPException(status_code=401, detail="Authenticated email required for history")
+    return email.lower()
 
 
 @app.get("/api/history/conversations")
