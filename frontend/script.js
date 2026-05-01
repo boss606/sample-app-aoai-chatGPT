@@ -1311,22 +1311,23 @@ function updateAttachmentsUI() {
         var iconColor = file.source === 'outlook' ? 'var(--primary-500)' : file.source === 'onedrive' ? '#0ea5e9' : file.source === 'box' ? '#0061d5' : 'var(--gray-500)';
         var statusHint;
         if (file.status === 'pending' || file.status === 'processing') {
-            statusHint = ' <span class="processing-badge"><i class="fas fa-spinner fa-spin"></i> Processing</span>';
+            statusHint = '<span class="processing-badge" style="margin-left:6px; flex-shrink:0;"><i class="fas fa-spinner fa-spin"></i> Processing</span>';
         } else if (file.status === 'completed') {
-            statusHint = ' <span class="ready-badge"><i class="fas fa-check-circle"></i></span>';
+            statusHint = '<span class="ready-badge" style="margin-left:6px; flex-shrink:0;"><i class="fas fa-check-circle"></i></span>';
         } else if (file.status === 'failed') {
             var failTitle = escapeHtml(file.error_message || 'Processing failed');
-            statusHint = ' <span class="error-badge" title="' + failTitle + '" style="color:#dc2626;"><i class="fas fa-exclamation-circle"></i> Failed</span>';
+            statusHint = '<span class="error-badge" title="' + failTitle + '" style="margin-left:6px; flex-shrink:0; color:#dc2626;"><i class="fas fa-exclamation-circle"></i> Failed</span>';
         } else if (file.status) {
             var unkTitle = escapeHtml('Unexpected status: ' + file.status);
-            statusHint = ' <span class="warning-badge" title="' + unkTitle + '" style="color:#d97706;"><i class="fas fa-question-circle"></i> Unknown</span>';
+            statusHint = '<span class="warning-badge" title="' + unkTitle + '" style="margin-left:6px; flex-shrink:0; color:#d97706;"><i class="fas fa-question-circle"></i> Unknown</span>';
         } else {
             statusHint = '';
         }
         html +=
             '<div class="attachment-chip">' +
                 '<i class="fas ' + getFileIcon(file.original_filename) + '" style="color: ' + iconColor + ';"></i>' +
-                '<span class="name">' + escapeHtml(file.original_filename) + statusHint + '</span>' +
+                '<span class="name">' + escapeHtml(file.original_filename) + '</span>' +
+                statusHint +
                 '<span class="remove" onclick="removeAttachment(' + index + ')"><i class="fas fa-times"></i></span>' +
             '</div>';
     });
