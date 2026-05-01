@@ -43,28 +43,30 @@ class LegalDocsStorage:
         self.raw_container = "legal-docs-raw"
         self.processed_container = "legal-docs-processed"
     
-    def upload_bytes(self, data: bytes, blob_name: str) -> bool:
+    def upload_bytes(self, data: bytes, blob_name: str, container: Optional[str] = None) -> bool:
         """
-        Upload arbitrary bytes to the raw container.
+        Upload arbitrary bytes to a container (defaults to raw_container).
 
         Args:
             data: Content to upload.
             blob_name: Name to save in blob storage.
+            container: Container name (defaults to raw_container).
 
         Returns:
             True if successful, False otherwise.
         """
+        c = container or self.raw_container
         try:
             blob_client = self.blob_service.get_blob_client(
-                container=self.raw_container,
+                container=c,
                 blob=blob_name
             )
 
             blob_client.upload_blob(data, overwrite=True)
 
-            logger.info(f"✅ Uploaded {blob_name} to {self.raw_container}")
+            logger.info(f"✅ Uploaded {blob_name} to {c}")
             return True
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to upload {blob_name}: {str(e)}")
             return False
@@ -87,21 +89,22 @@ class LegalDocsStorage:
             logger.error(f"❌ Failed to upload {blob_name}: {str(e)}")
             return False
 
-    def upload_text(self, content: str, blob_name: str, encoding: str = "utf-8") -> bool:
+    def upload_text(self, content: str, blob_name: str, encoding: str = "utf-8", container: Optional[str] = None) -> bool:
         """
-        Upload a text payload to the raw container.
+        Upload a text payload to a container (defaults to raw_container).
 
         Args:
             content: Text content to upload.
             blob_name: Name to save in blob storage.
             encoding: Text encoding (default utf-8).
+            container: Container name (defaults to raw_container).
 
         Returns:
             True if successful, False otherwise.
         """
         try:
             data = content.encode(encoding)
-            return self.upload_bytes(data, blob_name)
+            return self.upload_bytes(data, blob_name, container=container)
         except Exception as e:
             logger.error(f"❌ Failed to upload text {blob_name}: {str(e)}")
             return False
@@ -143,23 +146,25 @@ class LegalDocsStorage:
     def download_pdf(self, blob_name: str) -> bytes:
         return self.download_file(blob_name)
 
-    def delete_file(self, blob_name: str) -> bool:
+    def delete_file(self, blob_name: str, container: Optional[str] = None) -> bool:
         """
-        Delete a blob from the raw container.
+        Delete a blob from a container (defaults to raw_container).
 
         Args:
             blob_name: Name of blob to delete
+            container: Container name (defaults to raw_container).
 
         Returns:
             True if deleted or not found (idempotent), False otherwise.
         """
+        c = container or self.raw_container
         try:
             blob_client = self.blob_service.get_blob_client(
-                container=self.raw_container,
+                container=c,
                 blob=blob_name
             )
             blob_client.delete_blob(delete_snapshots="include")
-            logger.info(f"✅ Deleted {blob_name} from {self.raw_container}")
+            logger.info(f"✅ Deleted {blob_name} from {c}")
             return True
         except ResourceNotFoundError:
             logger.info(f"ℹ️ Blob already absent: {blob_name}")

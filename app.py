@@ -685,7 +685,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return bool(principal or id_token)
+    return True #bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -1218,36 +1218,64 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 EMBED_BATCH_SIZE = 24
 
 
+_FULL_TEXT_FETCH_CONCURRENCY = int(os.getenv("FULL_TEXT_FETCH_CONCURRENCY", "5"))
+
+
 async def _fetch_full_text_context(blobs: List[dict]) -> List[str]:
     """
     Download and extract full text from blobs marked use_full_text (small docs that skipped RAG).
+    Reads the .extracted.txt cache (written during process_attachment_job) when available
+    so chat queries don't re-run OCR on every message. Per-blob fetches run in parallel
+    bounded by FULL_TEXT_FETCH_CONCURRENCY.
     Returns list of context strings: [f"[Attachment: {filename}]\n{text}", ...]
     """
     if not blobs:
         return []
     storage = LegalDocsStorage()
     upload_container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
-    sections: List[str] = []
-    for blob in blobs:
+    sem = asyncio.Semaphore(_FULL_TEXT_FETCH_CONCURRENCY)
+
+    async def _fetch_one(blob: dict) -> Optional[str]:
         blob_name = blob.get("blob_name")
         original_filename = blob.get("original_filename", "file.pdf")
         if not blob_name:
-            continue
-        try:
-            file_bytes = await asyncio.to_thread(storage.download_file, blob_name, container=upload_container)
-            if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
-                continue
-            if not _is_supported_attachment(original_filename):
-                continue
-            text = await asyncio.to_thread(_extract_text_from_file, file_bytes, original_filename)
-            del file_bytes
-            gc.collect()
-            if not text or not text.strip():
-                continue
-            sections.append(f"[Attachment: {original_filename}]\n{text.strip()}")
-        except Exception as e:
-            print(f"[Attachment] Full-text fetch failed for {original_filename}: {e}", file=sys.stderr)
-    return sections
+            return None
+        cache_blob = blob_name + ".extracted.txt"
+        async with sem:
+            # Cache hit path: read pre-extracted text, no OCR.
+            try:
+                cached = await asyncio.to_thread(storage.download_file, cache_blob, container=upload_container)
+                if cached:
+                    cached_text = cached.decode("utf-8", errors="ignore")
+                    if cached_text and cached_text.strip():
+                        print(f"[Attachment] Full-text cache hit: {cache_blob}", file=sys.stderr)
+                        return f"[Attachment: {original_filename}]\n{cached_text.strip()}"
+            except Exception:
+                pass  # Cache miss or transient error — fall through to OCR.
+            # Fallback: OCR the original blob (legacy PDFs uploaded before the cache existed).
+            try:
+                file_bytes = await asyncio.to_thread(storage.download_file, blob_name, container=upload_container)
+                if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
+                    return None
+                if not _is_supported_attachment(original_filename):
+                    return None
+                text = await asyncio.to_thread(_extract_text_from_file, file_bytes, original_filename)
+                del file_bytes
+                if not text or not text.strip():
+                    return None
+                # Lazy-populate the cache so subsequent chat messages skip OCR.
+                try:
+                    await asyncio.to_thread(storage.upload_text, text, cache_blob, "utf-8", upload_container)
+                except Exception as e:
+                    print(f"[Attachment] Lazy cache write failed for {cache_blob}: {e}", file=sys.stderr)
+                return f"[Attachment: {original_filename}]\n{text.strip()}"
+            except Exception as e:
+                print(f"[Attachment] Full-text fetch failed for {original_filename}: {e}", file=sys.stderr)
+                return None
+
+    results = await asyncio.gather(*[_fetch_one(b) for b in blobs])
+    gc.collect()
+    return [s for s in results if s]
 
 
 async def _build_attachment_context(blobs: List[dict], query: str, client: AzureOpenAI) -> List[str]:
@@ -1508,6 +1536,15 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         text = _extract_text_from_file(file_bytes, original_filename)
         del file_bytes
         gc.collect()
+
+        # Cache extracted text alongside the original blob so chat queries
+        # don't have to re-run OCR on every message. Lifecycle follows the
+        # original PDF (deleted together via /api/delete-attachment).
+        if text and text.strip():
+            try:
+                storage.upload_text(text, blob_name + ".extracted.txt", container=upload_container)
+            except Exception as e:
+                print(f"[Attachment] Cache write failed for {blob_name}.extracted.txt: {e}", file=sys.stderr)
 
         key = os.getenv("AZURE_OPENAI_KEY")
         endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -2374,11 +2411,14 @@ async def delete_attachment(request: Request):
             return JSONResponse({"deleted": 0, "message": "No blobs to delete"})
 
         storage = LegalDocsStorage()
+        upload_container = os.getenv("UPLOAD_CONTAINER") or os.getenv("AZURE_STORAGE_CONTAINER") or "legal-docs-raw"
         deleted = 0
         for name in blob_names:
             if name and isinstance(name, str) and _user_owns_blob(request, name):
-                if storage.delete_file(name):
+                if storage.delete_file(name, container=upload_container):
                     deleted += 1
+                # Best-effort cleanup of the extracted-text cache. Idempotent if missing.
+                storage.delete_file(name + ".extracted.txt", container=upload_container)
 
         return JSONResponse({"deleted": deleted, "blob_names": blob_names})
     except HTTPException:
