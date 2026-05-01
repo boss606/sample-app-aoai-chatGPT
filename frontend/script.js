@@ -118,6 +118,18 @@ async function acceptAgreement() {
     }
 }
 
+// Block the attach button while Free Chat mode is on
+function syncAttachButtonForFreeMode() {
+    var toggle = document.getElementById('free-mode-toggle');
+    var attachBtn = document.querySelector('.btn-attach');
+    if (!toggle || !attachBtn) return;
+    var on = !!toggle.checked;
+    attachBtn.disabled = on;
+    attachBtn.title = on ? 'Disabled in Free Chat mode' : 'Attach Files';
+    attachBtn.style.opacity = on ? '0.4' : '';
+    attachBtn.style.cursor = on ? 'not-allowed' : '';
+}
+
 // Check agreement on page load
 document.addEventListener('DOMContentLoaded', function() {
     console.log('DOM loaded, checking agreement...');
@@ -125,6 +137,9 @@ document.addEventListener('DOMContentLoaded', function() {
     checkBoxStatus();
     loadUserInfo();
     updateSendButtonState();
+    syncAttachButtonForFreeMode();
+    var fmToggle = document.getElementById('free-mode-toggle');
+    if (fmToggle) fmToggle.addEventListener('change', syncAttachButtonForFreeMode);
 });
 
 // Delete uploaded blobs from storage when page unloads/reloads
@@ -1073,89 +1088,109 @@ async function handleFileSelect(event) {
     var files = event.target.files;
     if (!files || files.length === 0) return;
 
+    var fmToggle = document.getElementById('free-mode-toggle');
+    if (fmToggle && fmToggle.checked) {
+        addMessage('Disable Free Chat mode to attach files.', 'system');
+        event.target.value = '';
+        return;
+    }
+
     // Block sending immediately while upload+register is in progress.
     attachmentUploadInProgress = true;
     updateSendButtonState();
 
     try {
-        for (var i = 0; i < files.length; i++) {
-        var file = files[i];
-        var ext = (file.name || '').split('.').pop().toLowerCase();
-        if (ext !== 'pdf' && ext !== 'docx') {
-            addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
-            continue;
-        }
-        if (file.size > 50 * 1024 * 1024) {
-            addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
-            continue;
-        }
+        var fileArray = Array.from(files);
 
-        var statusId = addLoading('Uploading ' + file.name + '...');
-
-        try {
-            var urlResponse = await fetch('/api/get-upload-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: file.name }),
-                credentials: 'same-origin'
-            });
-
-            var urlData = await parseJsonResponse(urlResponse, 'get-upload-url');
-            if (urlData.error) throw new Error(urlData.error);
-
-            var uploadResponse = await fetch(urlData.upload_url, {
-                method: 'PUT',
-                headers: {
-                    'x-ms-blob-type': 'BlockBlob',
-                    'Content-Type': file.type || 'application/octet-stream'
-                },
-                body: file
-            });
-
-            if (!uploadResponse.ok) throw new Error('Upload failed');
-
-            var regResponse = await fetch('/api/register-attachment', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    blob_name: urlData.blob_name,
-                    original_filename: file.name
-                }),
-                credentials: 'same-origin'
-            });
-            var regData = await parseJsonResponse(regResponse, 'register-attachment').catch(function(e) {
-                return { error: e.message };
-            });
-            if (!regResponse.ok || !regData.job_id) {
-                removeMessage(statusId);
-                addMessage(regData.error || 'File uploaded but background processing failed. Please try again.', 'system-error');
+        async function uploadOne(file) {
+            var ext = (file.name || '').split('.').pop().toLowerCase();
+            if (ext !== 'pdf' && ext !== 'docx') {
+                addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
                 return;
             }
-            var jobId = regData.job_id;
-            var jobStatus = regData.status || 'pending';
-
-            attachedFiles.push({
-                blob_name: urlData.blob_name,
-                original_filename: file.name,
-                size: file.size,
-                source: 'local',
-                job_id: jobId,
-                status: jobStatus
-            });
-
-            updateAttachmentsUI();
-            if (jobStatus === 'pending' || jobStatus === 'processing') {
-                startAttachmentJobPolling(jobId);
+            if (file.size > 50 * 1024 * 1024) {
+                addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
+                return;
             }
-            removeMessage(statusId);
 
-        } catch (error) {
-            removeMessage(statusId);
-            addMessage('Failed to upload "' + file.name + '": ' + error.message, 'system-error');
+            var statusId = addLoading('Uploading ' + file.name + '...');
+
+            try {
+                var urlResponse = await fetch('/api/get-upload-url', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: file.name }),
+                    credentials: 'same-origin'
+                });
+
+                var urlData = await parseJsonResponse(urlResponse, 'get-upload-url');
+                if (urlData.error) throw new Error(urlData.error);
+
+                var uploadResponse = await fetch(urlData.upload_url, {
+                    method: 'PUT',
+                    headers: {
+                        'x-ms-blob-type': 'BlockBlob',
+                        'Content-Type': file.type || 'application/octet-stream'
+                    },
+                    body: file
+                });
+
+                if (!uploadResponse.ok) throw new Error('Upload failed');
+
+                var regResponse = await fetch('/api/register-attachment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        blob_name: urlData.blob_name,
+                        original_filename: file.name
+                    }),
+                    credentials: 'same-origin'
+                });
+                var regData = await parseJsonResponse(regResponse, 'register-attachment').catch(function(e) {
+                    return { error: e.message };
+                });
+                if (!regResponse.ok || !regData.job_id) {
+                    removeMessage(statusId);
+                    addMessage('Failed to register "' + file.name + '": ' + (regData.error || 'background processing failed'), 'system-error');
+                    return;
+                }
+                var jobId = regData.job_id;
+                var jobStatus = regData.status || 'pending';
+
+                attachedFiles.push({
+                    blob_name: urlData.blob_name,
+                    original_filename: file.name,
+                    size: file.size,
+                    source: 'local',
+                    job_id: jobId,
+                    status: jobStatus
+                });
+
+                updateAttachmentsUI();
+                if (jobStatus === 'pending' || jobStatus === 'processing') {
+                    startAttachmentJobPolling(jobId);
+                }
+                removeMessage(statusId);
+
+            } catch (error) {
+                removeMessage(statusId);
+                addMessage('Failed to upload "' + file.name + '": ' + error.message, 'system-error');
+            }
         }
-    }
 
-    event.target.value = '';
+        var queue = fileArray.slice();
+        var CONCURRENCY = Math.min(5, queue.length);
+        async function runWorker() {
+            while (queue.length > 0) {
+                var f = queue.shift();
+                await uploadOne(f);
+            }
+        }
+        var workers = [];
+        for (var w = 0; w < CONCURRENCY; w++) workers.push(runWorker());
+        await Promise.all(workers);
+
+        event.target.value = '';
     } finally {
         attachmentUploadInProgress = false;
         updateSendButtonState();
@@ -1409,7 +1444,7 @@ async function sendMessage() {
     var emailsToSend = freeMode ? [] : selectedEmails;
     var calendarToSend = freeMode ? [] : selectedCalendarEvents;
     if (freeMode && (attachedFiles.length > 0 || selectedEmails.length > 0 || selectedCalendarEvents.length > 0)) {
-        addMessage('Modo Free: anexos não são utilizados nesta mensagem.', 'system');
+        addMessage('Free mode: attachments are not used in this message.', 'system');
     }
 
     // Add agentic status indicator
@@ -1473,7 +1508,7 @@ async function sendMessage() {
                         } else if (ev.type === 'done') {
                             receivedDone = ev.complete === true;
                         } else if (ev.type === 'error') {
-                            fullText += '\n\n[Erro: ' + (ev.message || 'unknown') + ']';
+                            fullText += '\n\n[Error: ' + (ev.message || 'unknown') + ']';
                         }
                     } catch (e) { /* ignore parse errors */ }
                 }
@@ -1482,7 +1517,7 @@ async function sendMessage() {
 
         updateStreamingBubble(streamingBubble, fullText, true);
         if (!receivedDone && fullText) {
-            addMessage('Aviso: A resposta pode estar incompleta (conexão interrompida).', 'system');
+            addMessage('Warning: the response may be incomplete (connection interrupted).', 'system');
         }
         messageHistory.push({ role: 'assistant', content: fullText });
 
@@ -1516,7 +1551,7 @@ function updateStreamingBubble(streamingBubble, text, isComplete) {
     } else if (text) {
         streamingBubble.bubble.textContent = text;
     }
-    /* Se text estiver vazio e ainda não completou, mantém o spinner */
+    /* If text is empty and not yet complete, keep the spinner */
     var container = document.getElementById('chat-container');
     if (container) container.scrollTop = container.scrollHeight;
 }

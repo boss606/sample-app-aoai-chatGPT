@@ -24,9 +24,9 @@ var messageHistory = [];
 var searchSource = 'email';
 
 // --- HISTORY STATE ---
-var currentConversationId = null;  // null = conversa nova, ainda não persistida
-var historyEnabled = true;         // lido do backend ao carregar a página
-var sidebarConversations = [];     // cache local para sidebar instantânea
+var currentConversationId = null;  // null = new conversation, not yet persisted
+var historyEnabled = true;         // read from backend on page load
+var sidebarConversations = [];     // local cache for instant sidebar
 var selectedM365Items = [];
 var boxConnected = false;
 var boxAuthWindow = null;
@@ -183,6 +183,18 @@ async function acceptAgreement() {
     }
 }
 
+// Block the attach button while Free Chat mode is on
+function syncAttachButtonForFreeMode() {
+    var toggle = document.getElementById('free-mode-toggle');
+    var attachBtn = document.querySelector('.btn-attach');
+    if (!toggle || !attachBtn) return;
+    var on = !!toggle.checked;
+    attachBtn.disabled = on;
+    attachBtn.title = on ? 'Disabled in Free Chat mode' : 'Attach Files';
+    attachBtn.style.opacity = on ? '0.4' : '';
+    attachBtn.style.cursor = on ? 'not-allowed' : '';
+}
+
 // Check agreement on page load
 document.addEventListener('DOMContentLoaded', function() {
     console.log('DOM loaded, checking agreement...');
@@ -196,6 +208,9 @@ document.addEventListener('DOMContentLoaded', function() {
     if (fileInput) {
         fileInput.accept += ',.zip,application/zip,application/x-zip-compressed';
     }
+    syncAttachButtonForFreeMode();
+    var fmToggle = document.getElementById('free-mode-toggle');
+    if (fmToggle) fmToggle.addEventListener('change', syncAttachButtonForFreeMode);
 });
 
 // Delete uploaded blobs from storage when page unloads/reloads
@@ -1188,6 +1203,13 @@ async function handleFileSelect(event) {
     var files = event.target.files;
     if (!files || files.length === 0) return;
 
+    var fmToggle = document.getElementById('free-mode-toggle');
+    if (fmToggle && fmToggle.checked) {
+        addMessage('Disable Free Chat mode to attach files.', 'system');
+        event.target.value = '';
+        return;
+    }
+
     // Block sending immediately while upload+register is in progress.
     attachmentUploadInProgress = true;
     updateSendButtonState();
@@ -1206,16 +1228,15 @@ async function handleFileSelect(event) {
         }
     }
 
-    for (var i = 0; i < filesToProcess.length; i++) {
-        var file = filesToProcess[i];
+    async function uploadOne(file) {
         var ext = (file.name || '').split('.').pop().toLowerCase();
         if (ext !== 'pdf' && ext !== 'docx') {
             addMessage('File "' + file.name + '" rejected. Only PDF and Word (.docx) files are allowed.', 'system-error');
-            continue;
+            return;
         }
         if (file.size > 50 * 1024 * 1024) {
             addMessage('File "' + file.name + '" is too large. Maximum size is 50MB.', 'system-error');
-            continue;
+            return;
         }
 
         var statusId = addLoading('Uploading ' + file.name + '...');
@@ -1256,7 +1277,7 @@ async function handleFileSelect(event) {
             });
             if (!regResponse.ok || !regData.job_id) {
                 removeMessage(statusId);
-                addMessage(regData.error || 'File uploaded but background processing failed. Please try again.', 'system-error');
+                addMessage('Failed to register "' + file.name + '": ' + (regData.error || 'background processing failed'), 'system-error');
                 return;
             }
             var jobId = regData.job_id;
@@ -1282,6 +1303,18 @@ async function handleFileSelect(event) {
             addMessage('Failed to upload "' + file.name + '": ' + error.message, 'system-error');
         }
     }
+
+    var queue = filesToProcess.slice();
+    var CONCURRENCY = Math.min(5, queue.length);
+    async function runWorker() {
+        while (queue.length > 0) {
+            var f = queue.shift();
+            await uploadOne(f);
+        }
+    }
+    var workers = [];
+    for (var w = 0; w < CONCURRENCY; w++) workers.push(runWorker());
+    await Promise.all(workers);
 
     event.target.value = '';
     } finally {
@@ -1518,7 +1551,7 @@ async function newConversation() {
     if (historyEnabled) {
         await loadSidebar();
     } else {
-        // Só remove o destaque sem recarregar
+        // Just remove the highlight without reloading
         document.querySelectorAll('.sb-conv-item').forEach(function(el) {
             el.classList.remove('active');
         });
@@ -1593,7 +1626,7 @@ function _escHtml(str) {
 
 function _relativeTime(isoStr) {
     if (!isoStr) return '';
-    // CosmosDB armazena UTC sem 'Z' — forçar parse como UTC
+    // CosmosDB stores UTC without 'Z' — force parse as UTC
     var utc = isoStr.endsWith('Z') || isoStr.includes('+') ? isoStr : isoStr + 'Z';
     var diff = Date.now() - new Date(utc).getTime();
     var mins = Math.floor(diff / 60000);
@@ -1683,7 +1716,7 @@ async function onHistoryToggle(checked) {
 async function _persistHistory(userMessage, assistantMessage) {
     console.log('[History] _persistHistory called, currentConversationId=', currentConversationId);
     if (!currentConversationId) {
-        // Primeira interação: cria conversa + salva par no banco e atualiza sidebar
+        // First interaction: create conversation + save pair in DB and update sidebar
         try {
             console.log('[History] Creating new conversation...');
             var resp = await fetch('/api/history/conversations', {
@@ -1709,7 +1742,7 @@ async function _persistHistory(userMessage, assistantMessage) {
             console.error('[History] Failed to create conversation:', e);
         }
     } else {
-        // Turnos subsequentes: só salva no banco, sidebar não muda
+        // Subsequent turns: only save in DB, sidebar does not change
         try {
             var prevUserMsg = messageHistory[messageHistory.length - 2];
             var r = await fetch('/api/history/conversations/' + currentConversationId + '/messages', {
@@ -1773,7 +1806,7 @@ async function sendMessage() {
     var emailsToSend = freeMode ? [] : selectedEmails;
     var calendarToSend = freeMode ? [] : selectedCalendarEvents;
     if (freeMode && (attachedFiles.length > 0 || selectedEmails.length > 0 || selectedCalendarEvents.length > 0)) {
-        addMessage('Modo Free: anexos não são utilizados nesta mensagem.', 'system');
+        addMessage('Free mode: attachments are not used in this message.', 'system');
     }
 
     // Add agentic status indicator
@@ -1850,7 +1883,7 @@ async function sendMessage() {
         if (fullText) {
             messageHistory.push({ role: 'assistant', content: fullText });
 
-            // Persistir no histórico (apenas se habilitado e sem erro)
+            // Persist to history (only if enabled and no error)
             console.log('[History] check: historyEnabled=', historyEnabled, '| fullText len=', fullText.length, '| currentConversationId=', currentConversationId);
             if (historyEnabled) {
                 _persistHistory(userContent, fullText);
@@ -1888,7 +1921,7 @@ function updateStreamingBubble(streamingBubble, text, isComplete) {
     } else if (text) {
         streamingBubble.bubble.textContent = text;
     }
-    /* Se text estiver vazio e ainda não completou, mantém o spinner */
+    /* If text is empty and not yet complete, keep the spinner */
     var container = document.getElementById('chat-container');
     if (container) container.scrollTop = container.scrollHeight;
 }

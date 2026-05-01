@@ -149,7 +149,24 @@ def _run_queue_loop(stop: threading.Event) -> None:
             time.sleep(POLL_SECONDS)
 
 
+def _log_startup_banner() -> None:
+    """Log which storage account/queue this worker is consuming so a misconfigured
+    local run doesn't silently process production jobs."""
+    conn = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+    account = "<unknown>"
+    for part in conn.split(";"):
+        if part.startswith("AccountName="):
+            account = part.split("=", 1)[1]
+            break
+    print(
+        f"[QueueWorker] startup pid={os.getpid()} singleton={_SINGLETON_MODE} "
+        f"storage_account={account} queue={QUEUE_NAME} visibility={VISIBILITY_TIMEOUT}s",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
+    _log_startup_banner()
     if not _SINGLETON_MODE:
         print(f"[QueueWorker] Singleton disabled — listening queue={QUEUE_NAME}", file=sys.stderr)
         stop = threading.Event()

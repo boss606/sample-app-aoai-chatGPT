@@ -1446,11 +1446,46 @@ def _log_job_status_poll(job_id: str, status: str) -> None:
         _job_status_poll_log_state.pop(job_id, None)
 
 
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+_RETRYABLE_EXC_NAMES = {
+    "APIConnectionError", "APITimeoutError",
+    "ServiceRequestError", "ServiceResponseError",
+    "ConnectError", "ReadTimeout", "WriteTimeout", "ConnectTimeout",
+}
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    if status in _RETRYABLE_STATUS:
+        return True
+    return type(e).__name__ in _RETRYABLE_EXC_NAMES
+
+
+def _call_with_retry(fn, *, label: str, max_attempts: int = 3, base_delay: float = 2.0):
+    """Call fn() with exponential backoff on transient errors (429/503/connection).
+    Total budget for default args: ~6s of sleep across 3 attempts."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt >= max_attempts or not _is_retryable_error(e):
+                raise
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            delay = base_delay * (2 ** (attempt - 1))
+            print(
+                f"[Attachment] retry {label} attempt={attempt}/{max_attempts} "
+                f"error={type(e).__name__} status={status} sleep={delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 def process_attachment_job(job_id: str, partition_key: str, blob_name: str, original_filename: str):
     """
     Background task: download blob, extract PDF, chunk, embed, index to Azure Search.
     Updates job status to completed or failed.
     """
+    t0 = time.time()
     try:
         update_job_status(partition_key, job_id, "processing")
         search_service = os.getenv("AZURE_SEARCH_SERVICE")
@@ -1489,7 +1524,11 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         token_count = _count_tokens(text)
         if token_count <= ATTACHMENT_FULL_TEXT_MAX_TOKENS:
             update_job_status(partition_key, job_id, "completed", use_full_text=True, doc_type=doc_type)
-            print(f"[Attachment] Job {job_id} completed (full-text): {blob_name} -> {token_count} tokens", file=sys.stderr)
+            print(
+                f"[Attachment] Job {job_id} completed (full-text): {blob_name} -> "
+                f"{token_count} tokens (elapsed={time.time() - t0:.1f}s)",
+                file=sys.stderr,
+            )
             return
         chunk_texts = _chunk_text(text, max_chunks=ATTACHMENT_MAX_CHUNKS)
         del text
@@ -1506,12 +1545,17 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
         )
         blob_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", blob_name.replace("/", "_").replace(".pdf", ""))[:64]
         docs_to_upload = []
+        emb_total_batches = (len(chunk_texts) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
         for i in range(0, len(chunk_texts), EMBED_BATCH_SIZE):
             batch = [str(c) for c in chunk_texts[i : i + EMBED_BATCH_SIZE]]
-            emb_resp = client.embeddings.create(
-                model=EMBEDDING_DEPLOYMENT,
-                input=batch,
-                dimensions=VECTOR_DIMENSION,
+            emb_batch_idx = i // EMBED_BATCH_SIZE + 1
+            emb_resp = _call_with_retry(
+                lambda: client.embeddings.create(
+                    model=EMBEDDING_DEPLOYMENT,
+                    input=batch,
+                    dimensions=VECTOR_DIMENSION,
+                ),
+                label=f"embeddings job={job_id} batch={emb_batch_idx}/{emb_total_batches}",
             )
             for idx, (chunk_text, emb_obj) in enumerate(zip(batch, emb_resp.data)):
                 chunk_id = f"{blob_stem}-{i + idx}"
@@ -1526,19 +1570,42 @@ def process_attachment_job(job_id: str, partition_key: str, blob_name: str, orig
                     "metadata": json.dumps({"original_filename": original_filename}),
                     "contentVector": emb_obj.embedding,
                 })
+            print(
+                f"[Attachment] Job {job_id} embed batch {emb_batch_idx}/{emb_total_batches} "
+                f"size={len(batch)} elapsed={time.time() - t0:.1f}s",
+                file=sys.stderr,
+            )
             del emb_resp
             gc.collect()
         if docs_to_upload:
             batch_size = 50
+            search_total_batches = (len(docs_to_upload) + batch_size - 1) // batch_size
             for j in range(0, len(docs_to_upload), batch_size):
-                search_client.upload_documents(documents=docs_to_upload[j : j + batch_size])
+                search_batch_idx = j // batch_size + 1
+                slice_docs = docs_to_upload[j : j + batch_size]
+                _call_with_retry(
+                    lambda: search_client.upload_documents(documents=slice_docs),
+                    label=f"search job={job_id} batch={search_batch_idx}/{search_total_batches}",
+                )
+                print(
+                    f"[Attachment] Job {job_id} search batch {search_batch_idx}/{search_total_batches} "
+                    f"size={len(slice_docs)} elapsed={time.time() - t0:.1f}s",
+                    file=sys.stderr,
+                )
         update_job_status(partition_key, job_id, "completed", doc_type=doc_type)
-        print(f"[Attachment] Job {job_id} completed: {blob_name} -> {len(docs_to_upload)} chunks", file=sys.stderr)
+        print(
+            f"[Attachment] Job {job_id} completed: {blob_name} -> {len(docs_to_upload)} chunks "
+            f"(elapsed={time.time() - t0:.1f}s)",
+            file=sys.stderr,
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
         update_job_status(partition_key, job_id, "failed", str(e))
-        print(f"[Attachment] Job {job_id} failed: {e}", file=sys.stderr)
+        print(
+            f"[Attachment] Job {job_id} failed after {time.time() - t0:.1f}s: {e}",
+            file=sys.stderr,
+        )
 
 
 # ============== Tool Execution Functions ==============
@@ -1911,8 +1978,8 @@ def _extract_email_from_principal(user_info: dict) -> str:
 
 
 def _get_history_user_id(request: Request) -> str:
-    """Retorna user_id estável (e-mail) para o CosmosDB.
-    Exige autenticação Easy Auth — sem email = 401."""
+    """Returns a stable user_id (email) for CosmosDB.
+    Requires Easy Auth — no email = 401."""
     user_info = get_user_info(request)
     email = _extract_email_from_principal(user_info)
     if not email:
@@ -1922,7 +1989,7 @@ def _get_history_user_id(request: Request) -> str:
 
 @app.get("/api/history/conversations")
 async def history_list(request: Request):
-    """Lista conversas ativas do usuário ordenadas por mais recente (máx. 50)."""
+    """Lists the user's active conversations ordered by most recent (max 50)."""
     cosmos = _get_cosmos_client()
     if not cosmos:
         return JSONResponse({"conversations": [], "history_enabled": False})
@@ -1937,7 +2004,7 @@ async def history_list(request: Request):
 
 @app.get("/api/history/conversations/{conversation_id}/messages")
 async def history_messages(conversation_id: str, request: Request):
-    """Retorna todas as mensagens de uma conversa específica."""
+    """Returns all messages from a specific conversation."""
     cosmos = _get_cosmos_client()
     if not cosmos:
         raise HTTPException(status_code=503, detail="History not configured")
@@ -1952,8 +2019,8 @@ async def history_messages(conversation_id: str, request: Request):
 
 @app.post("/api/history/conversations")
 async def history_create(request: Request):
-    """Cria conversa e persiste o primeiro par pergunta/resposta.
-    Chamado pelo frontend SOMENTE após receber a primeira resposta com sucesso.
+    """Creates a conversation and persists the first question/answer pair.
+    Called by the frontend ONLY after the first successful response.
     Payload: { title, user_message, assistant_message }"""
     cosmos = _get_cosmos_client()
     if not cosmos:
@@ -1961,7 +2028,7 @@ async def history_create(request: Request):
     user_id = _get_history_user_id(request)
     try:
         data = await request.json()
-        title = (data.get("title") or data.get("user_message") or "Nova conversa")[:80]
+        title = (data.get("title") or data.get("user_message") or "New conversation")[:80]
         user_msg = data.get("user_message", "")
         assistant_msg = data.get("assistant_message", "")
 
@@ -1977,7 +2044,7 @@ async def history_create(request: Request):
 
 @app.post("/api/history/conversations/{conversation_id}/messages")
 async def history_add_messages(conversation_id: str, request: Request):
-    """Persiste um par de mensagens em conversa existente (turnos 2, 3, ...).
+    """Persists a message pair in an existing conversation (turns 2, 3, ...).
     Payload: { user_message, assistant_message }"""
     cosmos = _get_cosmos_client()
     if not cosmos:
@@ -1997,7 +2064,7 @@ async def history_add_messages(conversation_id: str, request: Request):
 
 @app.delete("/api/history/conversations/{conversation_id}")
 async def history_delete_one(conversation_id: str, request: Request):
-    """Soft-delete de uma conversa específica."""
+    """Soft-delete of a specific conversation."""
     cosmos = _get_cosmos_client()
     if not cosmos:
         raise HTTPException(status_code=503, detail="History not configured")
@@ -2012,7 +2079,7 @@ async def history_delete_one(conversation_id: str, request: Request):
 
 @app.delete("/api/history/conversations")
 async def history_clear_all(request: Request):
-    """Soft-delete de todas as conversas do usuário."""
+    """Soft-delete of all the user's conversations."""
     cosmos = _get_cosmos_client()
     if not cosmos:
         raise HTTPException(status_code=503, detail="History not configured")
@@ -2029,7 +2096,7 @@ async def history_clear_all(request: Request):
 
 @app.get("/api/history/preference")
 async def history_preference_get(request: Request):
-    """Lê preferência de histórico habilitado/desabilitado do usuário."""
+    """Reads the user's history enabled/disabled preference."""
     cosmos = _get_cosmos_client()
     if not cosmos:
         return JSONResponse({"history_enabled": True})
@@ -2040,13 +2107,13 @@ async def history_preference_get(request: Request):
         )
         return JSONResponse({"history_enabled": doc.get("history_enabled", True)})
     except Exception:
-        # Documento não existe ainda — padrão é habilitado
+        # Document does not exist yet — default is enabled
         return JSONResponse({"history_enabled": True})
 
 
 @app.post("/api/history/preference")
 async def history_preference_set(request: Request):
-    """Salva preferência de histórico habilitado/desabilitado.
+    """Saves the history enabled/disabled preference.
     Payload: { history_enabled: bool }"""
     cosmos = _get_cosmos_client()
     if not cosmos:
