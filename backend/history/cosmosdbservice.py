@@ -71,8 +71,8 @@ class CosmosConversationClient():
             return False
 
     async def delete_conversation(self, user_id, conversation_id):
-        """Soft-delete: marca active=False. Dados preservados para auditoria.
-        Hard delete físico via TTL do CosmosDB ou job de limpeza periódico."""
+        """Soft-delete: marks active=False. Data preserved for auditing.
+        Physical hard delete via CosmosDB TTL or a periodic cleanup job."""
         conversation = await self.get_conversation(user_id, conversation_id)
         if conversation:
             conversation['active'] = False
@@ -97,9 +97,9 @@ class CosmosConversationClient():
             {'name': '@userId', 'value': user_id},
             {'name': '@now', 'value': now}
         ]
-        # Filtra apenas conversas ativas e não expiradas.
-        # Suporte a documentos legados sem os campos active/expiresAt via IS_DEFINED.
-        # Sem ORDER BY para evitar índice composto no CosmosDB; ordenação feita em Python.
+        # Filter only active and non-expired conversations.
+        # Support legacy documents without active/expiresAt fields via IS_DEFINED.
+        # No ORDER BY to avoid a composite index in CosmosDB; sorting done in Python.
         query = """
             SELECT * FROM c
             WHERE c.userId = @userId

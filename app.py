@@ -254,6 +254,10 @@ PDF_OCR_DPI_LONG_DOCUMENT = int(os.getenv("PDF_OCR_DPI_LONG_DOCUMENT", "110"))
 PDF_OCR_MAX_WORKERS = int(os.getenv("PDF_OCR_MAX_WORKERS", "4"))
 # Below this token count, send full extracted text to LLM (skip RAG indexing)
 ATTACHMENT_FULL_TEXT_MAX_TOKENS = int(os.getenv("ATTACHMENT_FULL_TEXT_MAX_TOKENS", "4000"))
+# Map-Reduce: when combined inline attachments exceed this many tokens, fan out
+# into per-document LLM analysis + synthesis instead of one giant prompt.
+MAP_REDUCE_THRESHOLD_TOKENS = int(os.getenv("MAP_REDUCE_THRESHOLD_TOKENS", "10000"))
+MAP_REDUCE_MAX_CONCURRENCY = int(os.getenv("MAP_REDUCE_MAX_CONCURRENCY", "5"))
 ATTACHMENT_QUEUE_NAME = os.getenv("ATTACHMENT_QUEUE_NAME", "attachment-jobs")
 
 deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
@@ -685,7 +689,7 @@ def is_authenticated(request: Request) -> bool:
     """Check if user is authenticated via Azure Easy Auth."""
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     id_token = request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
-    return True #bool(principal or id_token)
+    return bool(principal or id_token)
 
 
 def get_graph_token(request: Request) -> Optional[str]:
@@ -1241,6 +1245,7 @@ async def _fetch_full_text_context(blobs: List[dict]) -> List[str]:
         if not blob_name:
             return None
         cache_blob = blob_name + ".extracted.txt"
+        t0 = time.perf_counter()
         async with sem:
             # Cache hit path: read pre-extracted text, no OCR.
             try:
@@ -1248,11 +1253,19 @@ async def _fetch_full_text_context(blobs: List[dict]) -> List[str]:
                 if cached:
                     cached_text = cached.decode("utf-8", errors="ignore")
                     if cached_text and cached_text.strip():
-                        print(f"[Attachment] Full-text cache hit: {cache_blob}", file=sys.stderr)
+                        print(
+                            f"[Attachment] Full-text cache HIT: {cache_blob} "
+                            f"({time.perf_counter() - t0:.2f}s)",
+                            file=sys.stderr,
+                        )
                         return f"[Attachment: {original_filename}]\n{cached_text.strip()}"
             except Exception:
                 pass  # Cache miss or transient error — fall through to OCR.
             # Fallback: OCR the original blob (legacy PDFs uploaded before the cache existed).
+            print(
+                f"[Attachment] Full-text cache MISS: {cache_blob} - running OCR fallback on hot path",
+                file=sys.stderr,
+            )
             try:
                 file_bytes = await asyncio.to_thread(storage.download_file, blob_name, container=upload_container)
                 if not file_bytes or len(file_bytes) > ATTACHMENT_MAX_BYTES:
@@ -1268,6 +1281,11 @@ async def _fetch_full_text_context(blobs: List[dict]) -> List[str]:
                     await asyncio.to_thread(storage.upload_text, text, cache_blob, "utf-8", upload_container)
                 except Exception as e:
                     print(f"[Attachment] Lazy cache write failed for {cache_blob}: {e}", file=sys.stderr)
+                print(
+                    f"[Attachment] OCR fallback completed: {cache_blob} "
+                    f"({time.perf_counter() - t0:.2f}s)",
+                    file=sys.stderr,
+                )
                 return f"[Attachment: {original_filename}]\n{text.strip()}"
             except Exception as e:
                 print(f"[Attachment] Full-text fetch failed for {original_filename}: {e}", file=sys.stderr)
@@ -2542,6 +2560,7 @@ def _stream_llm_to_queue_sync(client, model: str, messages: list, queue, loop, t
 
 async def _stream_llm_to_queue_async(async_client: AsyncAzureOpenAI, model: str, messages: list, queue: asyncio.Queue, temperature: float = 0.7):
     """Stream LLM tokens into queue using async client — no threads, true async concurrency."""
+    t0 = time.perf_counter()
     stream = await async_client.chat.completions.create(
         model=model,
         messages=messages,
@@ -2549,9 +2568,16 @@ async def _stream_llm_to_queue_async(async_client: AsyncAzureOpenAI, model: str,
         max_tokens=2000,
         stream=True,
     )
+    ttft_logged = False
     async for chunk in stream:
         content = (chunk.choices[0].delta.content or "") if chunk.choices else ""
         if content:
+            if not ttft_logged:
+                print(
+                    f"[perf] LLM TTFT: {time.perf_counter() - t0:.2f}s (model={model})",
+                    file=sys.stderr,
+                )
+                ttft_logged = True
             await queue.put(content)
     await queue.put(None)
 
@@ -2624,6 +2650,51 @@ async def _stream_with_tools_to_queue_async(
 
     # Stream 2nd response after tool execution
     await _stream_llm_to_queue_async(async_client, model, messages, queue, temperature=0.7)
+
+
+MAP_PROMPT = """You are analyzing a single legal document in isolation.
+Answer the user's question using ONLY the provided DOCUMENT.
+- If the document is not relevant to the question, reply "NOT RELEVANT" and stop.
+- Otherwise produce a concise analysis (<=400 words): facts, holdings or clauses, and direct quotes a synthesis step would cite.
+- Begin with the line "DOCUMENT: <filename>" using the filename from the "[Attachment: ...]" header at the top of DOCUMENT.
+- Do not speculate beyond the text. Do not reference other documents."""
+
+
+async def _map_attachments_parallel(
+    full_text_strings: List[str],
+    user_query: str,
+    async_client: AsyncAzureOpenAI,
+    deployment: str,
+) -> List[str]:
+    """Run per-document analysis LLM calls in parallel, bounded by
+    MAP_REDUCE_MAX_CONCURRENCY. Each input is one '[Attachment: name]\\n<text>'
+    string; returns the per-document partial answers in the same order. Per-call
+    failures yield a placeholder string instead of raising — one bad blob does
+    not fail the whole request.
+    """
+    sem = asyncio.Semaphore(MAP_REDUCE_MAX_CONCURRENCY)
+
+    async def _analyze_one(idx: int, doc_str: str) -> str:
+        async with sem:
+            try:
+                resp = await async_client.chat.completions.create(
+                    model=deployment,
+                    messages=[
+                        {"role": "system", "content": MAP_PROMPT},
+                        {"role": "user", "content": f"USER QUESTION:\n{user_query}\n\nDOCUMENT:\n{doc_str}"},
+                    ],
+                    temperature=0.2,
+                    max_tokens=800,
+                )
+                return resp.choices[0].message.content or "[empty analysis]"
+            except Exception as e:
+                print(
+                    f"[MapReduce] Document {idx + 1} analysis failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                return f"[Document {idx + 1} analysis failed: {type(e).__name__}]"
+
+    return await asyncio.gather(*[_analyze_one(i, s) for i, s in enumerate(full_text_strings)])
 
 
 async def _execute_agentic_logic(
@@ -2883,15 +2954,51 @@ async def _execute_agentic_logic(
 
         if attachment_contexts:
             no_context = False
-            chat_messages.append({
-                "role": "user",
-                "content": (
-                    "Use the following attachment excerpts to answer. "
-                    "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
-                    "Cite them as 'Attachment Source'.\n\n"
-                    + "\n\n".join(attachment_contexts)
+            total_ft_tokens = 0
+            use_map_reduce = False
+            if len(attachment_contexts) >= 2:
+                total_ft_tokens = sum(_count_tokens(s) for s in attachment_contexts)
+                use_map_reduce = total_ft_tokens > MAP_REDUCE_THRESHOLD_TOKENS
+
+            if use_map_reduce:
+                print(
+                    f"[MapReduce] Triggered: {len(attachment_contexts)} attachments, "
+                    f"~{total_ft_tokens} tokens > {MAP_REDUCE_THRESHOLD_TOKENS} threshold",
+                    file=sys.stderr,
                 )
-            })
+                t0_map = time.perf_counter()
+                partial_answers = await _map_attachments_parallel(
+                    attachment_contexts,
+                    search_query or "",
+                    async_client,
+                    deployment,
+                )
+                print(
+                    f"[perf] map_attachments_parallel: {time.perf_counter() - t0_map:.2f}s "
+                    f"for {len(attachment_contexts)} docs",
+                    file=sys.stderr,
+                )
+                chat_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Synthesize the following per-document analyses into a single coherent answer to the question. "
+                        "Each analysis was produced from one attachment in isolation. "
+                        "Cite each contributing document as 'Attachment Source: <filename>'. "
+                        "Reconcile any contradictions explicitly. "
+                        "If a document is marked NOT RELEVANT, you may omit it.\n\n"
+                        + "\n\n---\n\n".join(partial_answers)
+                    ),
+                })
+            else:
+                chat_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Use the following attachment excerpts to answer. "
+                        "Provide a separate section for EACH attachment, even if you just say it is not relevant. "
+                        "Cite them as 'Attachment Source'.\n\n"
+                        + "\n\n".join(attachment_contexts)
+                    )
+                })
 
         if has_prior_context:
             no_context = False
@@ -2922,7 +3029,15 @@ async def _execute_agentic_logic(
                 "content": msg.get("content", "")
             })
 
-        print(f"Total chat_messages: {len(chat_messages)}", file=sys.stderr)
+        total_prompt_tokens = sum(
+            _count_tokens(m.get("content") or "")
+            for m in chat_messages
+            if isinstance(m.get("content"), str)
+        )
+        print(
+            f"Total chat_messages: {len(chat_messages)}, ~{total_prompt_tokens} tokens",
+            file=sys.stderr,
+        )
         temperature = 0.2 if (legal_mode and not has_prior_context) else 0.5
         tools_for_request = get_tools(jid, j_config, bool(graph_token))
         print(f"Making Azure OpenAI call with tools={bool(tools_for_request)} legal_mode={legal_mode} temp={temperature}...", file=sys.stderr)
